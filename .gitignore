@@ -1,0 +1,19 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# macOS
+.DS_Store
+
+# Project data (WSI + annotations)
+data/
+
+# Plots / generated previews
+plots/
