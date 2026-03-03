@@ -1,45 +1,63 @@
 #!/usr/bin/env python3
 """
-On-demand Deep Zoom tile server for CAMELYON WSIs and overlays.
+Multi-slide Deep Zoom tile server for CAMELYON WSI Viewer.
+
+Supports:
+- Slide upload & local storage
+- Slide metadata (magnification, channels, vendor)
+- Color deconvolution (H&E / H-DAB separation via scikit-image)
+- Per-slide DeepZoom tile serving
+- Annotation & heatmap overlays
+- Mock model-based analysis (HoVerNet, SAM, etc.)
 
 Endpoints (under /api):
-- /api/dzi                          -> DZI XML for the base WSI
-- /api/tile/{level}/{col}_{row}.jpeg -> Base WSI tile (JPEG)
-- /api/overlay/annotations/dzi       -> DZI XML for annotation overlay (PNG)
-- /api/overlay/annotations/tile/{level}/{col}_{row}.png -> Annotation tile
-- /api/overlay/heatmap/dzi           -> DZI XML for heatmap overlay (PNG)
-- /api/overlay/heatmap/tile/{level}/{col}_{row}.png     -> Heatmap tile
-
-Static files (web UI) are served from ../web at "/".
+  /api/slides                                    -> List all slides
+  /api/slides/upload                             -> Upload a new slide (POST)
+  /api/slides/{slide_id}/info                    -> Slide metadata
+  /api/slides/{slide_id}/dzi                     -> DZI XML for base WSI
+  /api/slides/{slide_id}/tile/{l}/{c}_{r}.jpeg   -> Base WSI tile
+  /api/slides/{slide_id}/deconvolve/{channel}/dzi -> DZI for deconvolved channel
+  /api/slides/{slide_id}/deconvolve/{channel}/tile/{l}/{c}_{r}.png -> Deconvolved tile
+  /api/slides/{slide_id}/overlay/annotations/...  -> Annotation overlay
+  /api/slides/{slide_id}/overlay/heatmap/...      -> Heatmap overlay
+  /api/slides/{slide_id}/overlay/tissue/...       -> Tissue mask overlay
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
 import math
+import os
 import random
+import shutil
+import uuid
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 import xml.etree.ElementTree as ET
 
-import hashlib
-
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import FileResponse
+import numpy as np
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from openslide import OpenSlide
 from openslide.deepzoom import DeepZoomGenerator
 from PIL import Image, ImageDraw, ImageFilter
+from skimage.color import rgb2hed, hed2rgb
 
-# --- Configuration ---
+# ── Configuration ────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent
-SLIDE_PATH = ROOT / "data/camelyon17/training/center_0/patient_010_node_4.tif"
-ANNOTATION_XML = ROOT / "data/camelyon17/training/center_0/patient_010_node_4.xml"
+UPLOAD_DIR = ROOT / "data" / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+DEMO_SLIDE_PATH = ROOT / "data/camelyon17/training/center_0/patient_010_node_4.tif"
+DEMO_ANNOTATION_XML = ROOT / "data/camelyon17/training/center_0/patient_010_node_4.xml"
 TILE_SIZE = 256
 OVERLAP = 0
 LIMIT_BOUNDS = True
-HEATMAP_CELL_SIZE = 2048  # spacing between noise grid points (level-0 pixels)
-HEATMAP_OFFSET = (-2048, 0)  # shift heatmap noise field in level-0 coords (x, y)
+HEATMAP_CELL_SIZE = 2048
+HEATMAP_OFFSET = (-2048, 0)
+
 HEATMAP_PALETTES = {
     "metastasis": [
         (0.0, (40, 70, 170)),
@@ -59,21 +77,141 @@ HEATMAP_PALETTES = {
         (0.66, (200, 210, 120)),
         (1.0, (230, 190, 110)),
     ],
+    "inflammatory": [
+        (0.0, (80, 30, 120)),
+        (0.33, (140, 60, 160)),
+        (0.66, (200, 100, 180)),
+        (1.0, (240, 150, 200)),
+    ],
+    "necrosis": [
+        (0.0, (60, 60, 60)),
+        (0.33, (120, 80, 40)),
+        (0.66, (180, 120, 60)),
+        (1.0, (220, 160, 80)),
+    ],
 }
 
+# Model definitions
+MODELS = [
+    {
+        "id": "hovernet",
+        "label": "HoVerNet",
+        "description": "Simultaneous segmentation and classification of nuclei in multi-tissue histology images.",
+        "cell_types": ["metastasis", "epithelial", "inflammatory", "normal", "necrosis"],
+    },
+    {
+        "id": "sam",
+        "label": "Segment Anything (SAM)",
+        "description": "Foundation model for promptable segmentation across diverse image domains.",
+        "cell_types": ["metastasis", "epithelial", "normal"],
+    },
+    {
+        "id": "mock-default",
+        "label": "Mock Default",
+        "description": "Default mock model for demonstration purposes.",
+        "cell_types": ["metastasis", "epithelial", "normal"],
+    },
+    {
+        "id": "mock-hi-sens",
+        "label": "High Sensitivity",
+        "description": "Mock model calibrated for high sensitivity detection.",
+        "cell_types": ["metastasis", "epithelial", "normal"],
+    },
+    {
+        "id": "mock-hi-spec",
+        "label": "High Specificity",
+        "description": "Mock model calibrated for high specificity detection.",
+        "cell_types": ["metastasis", "epithelial", "normal"],
+    },
+]
 
-def _load_slide() -> tuple[OpenSlide, DeepZoomGenerator]:
-    slide = OpenSlide(str(SLIDE_PATH))
-    dz = DeepZoomGenerator(
-        slide, tile_size=TILE_SIZE, overlap=OVERLAP, limit_bounds=LIMIT_BOUNDS
-    )
-    return slide, dz
+
+# ── Slide Registry (in-memory) ──────────────────────────────────────────
+
+class SlideEntry:
+    """Manages one slide's OpenSlide + DeepZoomGenerator."""
+
+    def __init__(self, path: Path, annotation_xml: Optional[Path] = None, display_name: Optional[str] = None):
+        self.path = path
+        self.annotation_xml = annotation_xml
+        self.display_name = display_name or path.stem
+        self.slide = OpenSlide(str(path))
+        self.dz = DeepZoomGenerator(
+            self.slide, tile_size=TILE_SIZE, overlap=OVERLAP, limit_bounds=LIMIT_BOUNDS
+        )
+        self.l0_downsamples = tuple(
+            2 ** (self.dz.level_count - dz_level - 1)
+            for dz_level in range(self.dz.level_count)
+        )
+        self._polygons_cache = None
+
+    @property
+    def slide_id(self) -> str:
+        return hashlib.sha256(str(self.path).encode()).hexdigest()[:12]
+
+    @property
+    def polygons(self):
+        if self._polygons_cache is None:
+            if self.annotation_xml and self.annotation_xml.exists():
+                self._polygons_cache = _load_polygons(self.annotation_xml)
+            else:
+                self._polygons_cache = []
+        return self._polygons_cache
+
+    def get_properties(self) -> dict:
+        props = dict(self.slide.properties)
+        magnification = props.get("openslide.objective-power", "Unknown")
+        vendor = props.get("openslide.vendor", "Unknown")
+        mpp_x = props.get("openslide.mpp-x", None)
+        mpp_y = props.get("openslide.mpp-y", None)
+
+        # Detect stain channels
+        channels = self._detect_channels()
+
+        return {
+            "slide_id": self.slide_id,
+            "filename": self.path.name,
+            "display_name": self.display_name,
+            "dimensions": self.slide.dimensions,
+            "magnification": magnification,
+            "vendor": vendor,
+            "mpp_x": mpp_x,
+            "mpp_y": mpp_y,
+            "level_count": self.dz.level_count,
+            "tile_size": TILE_SIZE,
+            "channels": channels,
+            "annotations_count": len(self.polygons),
+            "file_size_mb": round(self.path.stat().st_size / (1024 * 1024), 1),
+        }
+
+    def _detect_channels(self) -> list[dict]:
+        """Detect available stain channels. For H&E and H-DAB staining."""
+        channels = [
+            {"id": "original", "label": "Original (RGB)", "description": "Full color composite"},
+            {"id": "hematoxylin", "label": "Hematoxylin (H)", "description": "Nuclear stain — blue/purple"},
+            {"id": "eosin", "label": "Eosin (E)", "description": "Cytoplasm/ECM stain — pink"},
+            {"id": "dab", "label": "DAB", "description": "IHC chromogen — brown"},
+        ]
+        return channels
 
 
-def _l0_downsamples_for_dz(dz: DeepZoomGenerator) -> tuple[int, ...]:
-    """DeepZoomGenerator exposes level_count; derive l0 downsample per deep zoom level."""
-    return tuple(2 ** (dz.level_count - dz_level - 1) for dz_level in range(dz.level_count))
+# Global slide registry
+_slide_registry: dict[str, SlideEntry] = {}
 
+
+def _register_slide(path: Path, annotation_xml: Optional[Path] = None, display_name: Optional[str] = None) -> SlideEntry:
+    entry = SlideEntry(path, annotation_xml, display_name)
+    _slide_registry[entry.slide_id] = entry
+    return entry
+
+
+def _get_slide(slide_id: str) -> SlideEntry:
+    if slide_id not in _slide_registry:
+        raise HTTPException(status_code=404, detail=f"Slide '{slide_id}' not found")
+    return _slide_registry[slide_id]
+
+
+# ── Helper Functions ─────────────────────────────────────────────────────
 
 def _load_polygons(xml_path: Path):
     root = ET.parse(xml_path).getroot()
@@ -89,14 +227,12 @@ def _load_polygons(xml_path: Path):
         color = ann.attrib.get("Color") or "#F4FA58"
         xs = [p[0] for p in coords]
         ys = [p[1] for p in coords]
-        polys.append(
-            {
-                "label": label,
-                "coords": coords,
-                "color": color,
-                "bbox": (min(xs), min(ys), max(xs), max(ys)),
-            }
-        )
+        polys.append({
+            "label": label,
+            "coords": coords,
+            "color": color,
+            "bbox": (min(xs), min(ys), max(xs), max(ys)),
+        })
     return polys
 
 
@@ -111,17 +247,56 @@ def _polys_bbox(polys):
     return (min(xs), min(ys), max(xs), max(ys))
 
 
-@lru_cache(maxsize=1)
-def _polygons():
-    return _load_polygons(ANNOTATION_XML)
-
-
 def _dzi_xml(width: int, height: int, tile_size: int, overlap: int, fmt: str) -> str:
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Image xmlns="http://schemas.microsoft.com/deepzoom/2008" TileSize="{tile_size}" Overlap="{overlap}" Format="{fmt}">
     <Size Width="{width}" Height="{height}"/>
 </Image>
 """
+
+
+def _model_seed(model: str) -> int:
+    digest = hashlib.sha256(model.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "little")
+
+
+def _smooth_noise_score(x_l0: float, y_l0: float, spacing: float, model_seed: int) -> float:
+    gx = x_l0 / spacing
+    gy = y_l0 / spacing
+    x0 = math.floor(gx)
+    y0 = math.floor(gy)
+    tx = gx - x0
+    ty = gy - y0
+
+    def val(ix, iy):
+        rng = random.Random((ix * 73856093) ^ (iy * 19349663) ^ model_seed)
+        return rng.random()
+
+    v00 = val(x0, y0)
+    v10 = val(x0 + 1, y0)
+    v01 = val(x0, y0 + 1)
+    v11 = val(x0 + 1, y0 + 1)
+    v0 = v00 * (1 - tx) + v10 * tx
+    v1 = v01 * (1 - tx) + v11 * tx
+    return v0 * (1 - ty) + v1 * ty
+
+
+def _colormap(score: float, palette_name: str = "metastasis"):
+    score = max(0.0, min(1.0, score))
+    stops = HEATMAP_PALETTES.get(palette_name, HEATMAP_PALETTES["metastasis"])
+    for i in range(len(stops) - 1):
+        s0, c0 = stops[i]
+        s1, c1 = stops[i + 1]
+        if score <= s1:
+            t = (score - s0) / (s1 - s0 + 1e-9)
+            r = int(c0[0] + t * (c1[0] - c0[0]))
+            g = int(c0[1] + t * (c1[1] - c0[1]))
+            b = int(c0[2] + t * (c1[2] - c0[2]))
+            break
+    else:
+        r, g, b = stops[-1][1]
+    alpha = int(70 + 90 * score)
+    return (r, g, b, alpha)
 
 
 def _draw_annotations_tile(polys, tile, lvl, col, row, tile_size, l0_downsamples, offset):
@@ -148,7 +323,6 @@ def _draw_annotations_tile(polys, tile, lvl, col, row, tile_size, l0_downsamples
 
 
 def _draw_tissue_tile(tile, lvl, col, row, tile_size, l0_downsamples, offset, bbox):
-    """Render a simple tissue mask based on the union bbox of annotations (placeholder)."""
     if bbox is None:
         return
     draw = ImageDraw.Draw(tile, "RGBA")
@@ -156,7 +330,7 @@ def _draw_tissue_tile(tile, lvl, col, row, tile_size, l0_downsamples, offset, bb
     origin_x = col * tile_size
     origin_y = row * tile_size
     x0, y0, x1, y1 = bbox
-    pad = 4096  # add padding to cover nearby tissue
+    pad = 4096
     x0 -= pad
     y0 -= pad
     x1 += pad
@@ -168,34 +342,8 @@ def _draw_tissue_tile(tile, lvl, col, row, tile_size, l0_downsamples, offset, bb
     draw.rectangle([zx0, zy0, zx1, zy1], fill=(180, 220, 255, 50), outline=None)
 
 
-def _model_seed(model: str) -> int:
-    digest = hashlib.sha256(model.encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "little")
-
-
-def _smooth_noise_score(x_l0: float, y_l0: float, spacing: float, model_seed: int) -> float:
-    """Deterministic smooth noise via bilinear interpolation on a coarse grid."""
-    gx = x_l0 / spacing
-    gy = y_l0 / spacing
-    x0 = math.floor(gx)
-    y0 = math.floor(gy)
-    tx = gx - x0
-    ty = gy - y0
-
-    def val(ix, iy):
-        rng = random.Random((ix * 73856093) ^ (iy * 19349663) ^ model_seed)
-        return rng.random()
-
-    v00 = val(x0, y0)
-    v10 = val(x0 + 1, y0)
-    v01 = val(x0, y0 + 1)
-    v11 = val(x0 + 1, y0 + 1)
-    v0 = v00 * (1 - tx) + v10 * tx
-    v1 = v01 * (1 - tx) + v11 * tx
-    return v0 * (1 - ty) + v1 * ty
-
-
-def _draw_heatmap_tile(tile, lvl, col, row, tile_size, l0_downsamples, offset, spacing, model_seed, palette, bbox=None, field_offset=(0, 0)):
+def _draw_heatmap_tile(tile, lvl, col, row, tile_size, l0_downsamples, offset, spacing,
+                       model_seed, palette, bbox=None, field_offset=(0, 0), draw_vector=False):
     down = l0_downsamples[lvl]
     origin_x = col * tile_size
     origin_y = row * tile_size
@@ -218,32 +366,107 @@ def _draw_heatmap_tile(tile, lvl, col, row, tile_size, l0_downsamples, offset, s
             l0_x = (origin_x + x) * down + offset[0]
             if bbox and (l0_x < bx0 or l0_x > bx1):
                 continue
-            score = _smooth_noise_score(l0_x + field_offset[0], l0_y + field_offset[1], spacing, model_seed)
+            score = _smooth_noise_score(
+                l0_x + field_offset[0], l0_y + field_offset[1], spacing, model_seed
+            )
             r, g, b, a = _colormap(score, palette)
             pix[x, y] = (r, g, b, a)
 
+    if draw_vector and tile_size >= 128:
+        draw = ImageDraw.Draw(tile, "RGBA")
+        step = 32
+        max_arrow_len = 14
+        min_arrow_len = 4
+        delta = spacing * 0.1
 
-def _colormap(score: float, palette_name: str = "metastasis"):
-    score = max(0.0, min(1.0, score))
-    stops = HEATMAP_PALETTES.get(palette_name, HEATMAP_PALETTES["metastasis"])
-    for i in range(len(stops) - 1):
-        s0, c0 = stops[i]
-        s1, c1 = stops[i + 1]
-        if score <= s1:
-            t = (score - s0) / (s1 - s0 + 1e-9)
-            r = int(c0[0] + t * (c1[0] - c0[0]))
-            g = int(c0[1] + t * (c1[1] - c0[1]))
-            b = int(c0[2] + t * (c1[2] - c0[2]))
-            break
+        for y in range(step // 2, tile.height, step):
+            l0_y = (origin_y + y) * down + offset[1]
+            if bbox and (l0_y < by0 or l0_y > by1):
+                continue
+            for x in range(step // 2, tile.width, step):
+                l0_x = (origin_x + x) * down + offset[0]
+                if bbox and (l0_x < bx0 or l0_x > bx1):
+                    continue
+
+                lx = l0_x + field_offset[0]
+                ly = l0_y + field_offset[1]
+                s_right = _smooth_noise_score(lx + delta, ly, spacing, model_seed)
+                s_left = _smooth_noise_score(lx - delta, ly, spacing, model_seed)
+                s_down = _smooth_noise_score(lx, ly + delta, spacing, model_seed)
+                s_up = _smooth_noise_score(lx, ly - delta, spacing, model_seed)
+
+                dx = s_right - s_left
+                dy = s_down - s_up
+                mag = math.hypot(dx, dy)
+                norm_mag = min(1.0, mag / 0.05)
+
+                if norm_mag < 0.1:
+                    continue
+
+                dx /= mag
+                dy /= mag
+                arrow_len = min_arrow_len + (max_arrow_len - min_arrow_len) * norm_mag
+                alpha = int(100 + 155 * norm_mag)
+
+                end_x = x + dx * arrow_len
+                end_y = y + dy * arrow_len
+
+                shadow_color = (0, 0, 0, int(alpha * 0.6))
+                sw = 1
+                draw.line([(x + sw, y + sw), (end_x + sw, end_y + sw)], fill=shadow_color, width=1)
+                color = (255, 255, 255, alpha)
+                draw.line([(x, y), (end_x, end_y)], fill=color, width=1)
+
+                angle = math.atan2(dy, dx)
+                head_len = 4 + 2 * norm_mag
+                angle1 = angle + math.pi * 0.90
+                angle2 = angle - math.pi * 0.90
+                hx1 = end_x + math.cos(angle1) * head_len
+                hy1 = end_y + math.sin(angle1) * head_len
+                hx2 = end_x + math.cos(angle2) * head_len
+                hy2 = end_y + math.sin(angle2) * head_len
+                draw.polygon([(end_x + sw, end_y + sw), (hx1 + sw, hy1 + sw), (hx2 + sw, hy2 + sw)], fill=shadow_color)
+                draw.polygon([(end_x, end_y), (hx1, hy1), (hx2, hy2)], fill=color)
+
+
+def _deconvolve_tile(tile_img: Image.Image, channel: str) -> Image.Image:
+    """Apply color deconvolution and return the requested channel as a false-color image."""
+    arr = np.array(tile_img.convert("RGB")).astype(np.float64) / 255.0
+
+    # Clamp to avoid log issues with pure white/black
+    arr = np.clip(arr, 1e-6, 1.0)
+
+    # rgb2hed returns Hematoxylin, Eosin, DAB in channels 0, 1, 2
+    hed = rgb2hed(arr)
+
+    if channel == "hematoxylin":
+        # Reconstruct only hematoxylin channel
+        out = np.zeros_like(hed)
+        out[:, :, 0] = hed[:, :, 0]
+        rgb = hed2rgb(out)
+    elif channel == "eosin":
+        out = np.zeros_like(hed)
+        out[:, :, 1] = hed[:, :, 1]
+        rgb = hed2rgb(out)
+    elif channel == "dab":
+        out = np.zeros_like(hed)
+        out[:, :, 2] = hed[:, :, 2]
+        rgb = hed2rgb(out)
     else:
-        r, g, b = stops[-1][1]
-    alpha = int(70 + 90 * score)  # softer by default
-    return (r, g, b, alpha)
+        rgb = arr
+
+    rgb = np.clip(rgb * 255, 0, 255).astype(np.uint8)
+    return Image.fromarray(rgb, "RGB")
 
 
-app = FastAPI(title="CAMELYON Deep Zoom Server", docs_url="/api/docs", openapi_url="/api/openapi.json")
+# ── FastAPI App ──────────────────────────────────────────────────────────
 
-# Serve static web UI under /web; root ("/") returns index.html for convenience
+app = FastAPI(
+    title="CAMELYON Multi-Slide Deep Zoom Server",
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json",
+)
+
 web_root = ROOT / "web"
 if web_root.exists():
     app.mount("/web", StaticFiles(directory=web_root, html=True), name="web")
@@ -258,133 +481,270 @@ def root():
         return {"message": "index.html not found in web/", "visit": "/api/docs"}
     return FileResponse(index_path)
 
-_slide, _dz = _load_slide()
-_l0_downsamples = _l0_downsamples_for_dz(_dz)
+
+# ── Register demo slide at startup ───────────────────────────────────────
+
+def _init_demo():
+    if DEMO_SLIDE_PATH.exists():
+        ann = DEMO_ANNOTATION_XML if DEMO_ANNOTATION_XML.exists() else None
+        _register_slide(DEMO_SLIDE_PATH, ann, display_name="Patient 010 Node 4 (Demo)")
+    # Register any previously uploaded slides
+    for f in UPLOAD_DIR.iterdir():
+        if f.suffix.lower() in (".tif", ".tiff", ".svs", ".ndpi", ".mrxs"):
+            xml_candidate = f.with_suffix(".xml")
+            ann = xml_candidate if xml_candidate.exists() else None
+            _register_slide(f, ann)
 
 
-@app.get("/api/dzi")
-def get_dzi():
-    xml = _dz.get_dzi("jpeg")
+_init_demo()
+
+
+# ── Slide Management ────────────────────────────────────────────────────
+
+@app.get("/api/slides")
+def list_slides():
+    return [entry.get_properties() for entry in _slide_registry.values()]
+
+
+@app.post("/api/slides/upload")
+async def upload_slide(file: UploadFile = File(...)):
+    valid_exts = {".tif", ".tiff", ".svs", ".ndpi", ".mrxs"}
+    ext = Path(file.filename or "unknown.tif").suffix.lower()
+    if ext not in valid_exts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type '{ext}'. Accepted: {', '.join(valid_exts)}",
+        )
+
+    dest = UPLOAD_DIR / (file.filename or f"slide_{uuid.uuid4().hex[:8]}{ext}")
+
+    # If file already exists, check if it's already registered
+    if dest.exists():
+        existing_id = hashlib.sha256(str(dest).encode()).hexdigest()[:12]
+        if existing_id in _slide_registry:
+            return _slide_registry[existing_id].get_properties()
+
+    # Write in chunks to avoid blocking for large files
+    with open(dest, "wb") as f:
+        while chunk := await file.read(1024 * 1024):  # 1MB chunks
+            f.write(chunk)
+
+    try:
+        entry = _register_slide(dest)
+        return entry.get_properties()
+    except Exception as e:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Failed to open slide: {e}")
+
+
+@app.delete("/api/slides/{slide_id}")
+def delete_slide(slide_id: str):
+    entry = _get_slide(slide_id)
+    # Don't delete demo slide's file
+    if entry.path == DEMO_SLIDE_PATH:
+        raise HTTPException(status_code=403, detail="Cannot delete the demo slide")
+    entry.slide.close()
+    entry.path.unlink(missing_ok=True)
+    del _slide_registry[slide_id]
+    return {"status": "deleted", "slide_id": slide_id}
+
+
+@app.get("/api/slides/{slide_id}/info")
+def slide_info(slide_id: str):
+    entry = _get_slide(slide_id)
+    info = entry.get_properties()
+    info["models"] = MODELS
+    return info
+
+
+# ── Per-Slide DZI & Tiles ───────────────────────────────────────────────
+
+@app.get("/api/slides/{slide_id}/dzi")
+def get_slide_dzi(slide_id: str):
+    entry = _get_slide(slide_id)
+    xml = entry.dz.get_dzi("jpeg")
     return Response(xml, media_type="application/xml")
 
 
-@app.get("/api/tile/{level}/{col}_{row}.jpeg")
-def get_tile(level: int, col: int, row: int):
-    if level < 0 or level >= _dz.level_count:
+@app.get("/api/slides/{slide_id}/tile/{level}/{col}_{row}.jpeg")
+def get_slide_tile(slide_id: str, level: int, col: int, row: int):
+    entry = _get_slide(slide_id)
+    dz = entry.dz
+    if level < 0 or level >= dz.level_count:
         raise HTTPException(status_code=404, detail="Invalid level")
-    cols, rows = _dz.level_tiles[level]
+    cols, rows = dz.level_tiles[level]
     if col < 0 or row < 0 or col >= cols or row >= rows:
         raise HTTPException(status_code=404, detail="Invalid tile address")
-    tile = _dz.get_tile(level, (col, row))
+    tile = dz.get_tile(level, (col, row))
     buf = io.BytesIO()
     tile.save(buf, format="JPEG")
     return Response(buf.getvalue(), media_type="image/jpeg")
 
 
-@app.get("/api/overlay/annotations/dzi")
-def get_annotations_dzi():
-    w, h = _slide.dimensions
+# ── Color Deconvolution Tiles ────────────────────────────────────────────
+
+@app.get("/api/slides/{slide_id}/deconvolve/{channel}/dzi")
+def get_deconvolve_dzi(slide_id: str, channel: str):
+    entry = _get_slide(slide_id)
+    valid_channels = {"original", "hematoxylin", "eosin", "dab"}
+    if channel not in valid_channels:
+        raise HTTPException(status_code=400, detail=f"Invalid channel '{channel}'. Valid: {valid_channels}")
+    w, h = entry.slide.dimensions
     xml = _dzi_xml(w, h, TILE_SIZE, OVERLAP, "png")
     return Response(xml, media_type="application/xml")
 
 
-@app.get("/api/overlay/annotations/tile/{level}/{col}_{row}.png")
-def get_annotations_tile(level: int, col: int, row: int):
-    if level < 0 or level >= _dz.level_count:
+@app.get("/api/slides/{slide_id}/deconvolve/{channel}/tile/{level}/{col}_{row}.png")
+def get_deconvolve_tile(slide_id: str, channel: str, level: int, col: int, row: int):
+    entry = _get_slide(slide_id)
+    dz = entry.dz
+    valid_channels = {"original", "hematoxylin", "eosin", "dab"}
+    if channel not in valid_channels:
+        raise HTTPException(status_code=400, detail=f"Invalid channel")
+    if level < 0 or level >= dz.level_count:
         raise HTTPException(status_code=404, detail="Invalid level")
-    cols, rows = _dz.level_tiles[level]
-    if col < 0 or row < 0 or col >= cols or row >= rows:
+    cols_count, rows_count = dz.level_tiles[level]
+    if col < 0 or row < 0 or col >= cols_count or row >= rows_count:
         raise HTTPException(status_code=404, detail="Invalid tile address")
-    # Get tile dimensions from dz (respect limit_bounds edges)
-    _, z_size = _dz._get_tile_info(level, (col, row))
-    tile = Image.new("RGBA", z_size, (0, 0, 0, 0))
-    _draw_annotations_tile(_polygons(), tile, level, col, row, TILE_SIZE, _l0_downsamples, _dz._l0_offset)
+
+    tile = dz.get_tile(level, (col, row))
+
+    if channel != "original":
+        tile = _deconvolve_tile(tile, channel)
+
     buf = io.BytesIO()
     tile.save(buf, format="PNG")
     return Response(buf.getvalue(), media_type="image/png")
 
 
-@app.get("/api/overlay/tissue/dzi")
-def get_tissue_dzi():
-    w, h = _slide.dimensions
+# ── Annotation Overlay ───────────────────────────────────────────────────
+
+@app.get("/api/slides/{slide_id}/overlay/annotations/dzi")
+def get_annotations_dzi(slide_id: str):
+    entry = _get_slide(slide_id)
+    w, h = entry.slide.dimensions
     xml = _dzi_xml(w, h, TILE_SIZE, OVERLAP, "png")
     return Response(xml, media_type="application/xml")
 
 
-@app.get("/api/overlay/tissue/tile/{level}/{col}_{row}.png")
-def get_tissue_tile(level: int, col: int, row: int):
-    if level < 0 or level >= _dz.level_count:
+@app.get("/api/slides/{slide_id}/overlay/annotations/tile/{level}/{col}_{row}.png")
+def get_annotations_tile(slide_id: str, level: int, col: int, row: int):
+    entry = _get_slide(slide_id)
+    dz = entry.dz
+    if level < 0 or level >= dz.level_count:
         raise HTTPException(status_code=404, detail="Invalid level")
-    cols, rows = _dz.level_tiles[level]
-    if col < 0 or row < 0 or col >= cols or row >= rows:
+    cols_count, rows_count = dz.level_tiles[level]
+    if col < 0 or row < 0 or col >= cols_count or row >= rows_count:
         raise HTTPException(status_code=404, detail="Invalid tile address")
-    _, z_size = _dz._get_tile_info(level, (col, row))
+    _, z_size = dz._get_tile_info(level, (col, row))
     tile = Image.new("RGBA", z_size, (0, 0, 0, 0))
-    bbox = _polys_bbox(_polygons())
-    _draw_tissue_tile(tile, level, col, row, TILE_SIZE, _l0_downsamples, _dz._l0_offset, bbox)
+    _draw_annotations_tile(entry.polygons, tile, level, col, row, TILE_SIZE, entry.l0_downsamples, dz._l0_offset)
     buf = io.BytesIO()
     tile.save(buf, format="PNG")
     return Response(buf.getvalue(), media_type="image/png")
 
 
-@app.get("/api/overlay/heatmap/dzi")
-def get_heatmap_dzi():
-    w, h = _slide.dimensions
+# ── Tissue Mask Overlay ──────────────────────────────────────────────────
+
+@app.get("/api/slides/{slide_id}/overlay/tissue/dzi")
+def get_tissue_dzi(slide_id: str):
+    entry = _get_slide(slide_id)
+    w, h = entry.slide.dimensions
     xml = _dzi_xml(w, h, TILE_SIZE, OVERLAP, "png")
     return Response(xml, media_type="application/xml")
 
 
-@app.get("/api/overlay/heatmap/tile/{level}/{col}_{row}.png")
-def get_heatmap_tile(level: int, col: int, row: int, model: str = "mock-default", cell: str = "metastasis"):
-    if level < 0 or level >= _dz.level_count:
+@app.get("/api/slides/{slide_id}/overlay/tissue/tile/{level}/{col}_{row}.png")
+def get_tissue_tile(slide_id: str, level: int, col: int, row: int):
+    entry = _get_slide(slide_id)
+    dz = entry.dz
+    if level < 0 or level >= dz.level_count:
         raise HTTPException(status_code=404, detail="Invalid level")
-    cols, rows = _dz.level_tiles[level]
-    if col < 0 or row < 0 or col >= cols or row >= rows:
+    cols_count, rows_count = dz.level_tiles[level]
+    if col < 0 or row < 0 or col >= cols_count or row >= rows_count:
         raise HTTPException(status_code=404, detail="Invalid tile address")
-    _, z_size = _dz._get_tile_info(level, (col, row))
+    _, z_size = dz._get_tile_info(level, (col, row))
     tile = Image.new("RGBA", z_size, (0, 0, 0, 0))
-    bbox = _polys_bbox(_polygons())
+    bbox = _polys_bbox(entry.polygons)
+    _draw_tissue_tile(tile, level, col, row, TILE_SIZE, entry.l0_downsamples, dz._l0_offset, bbox)
+    buf = io.BytesIO()
+    tile.save(buf, format="PNG")
+    return Response(buf.getvalue(), media_type="image/png")
+
+
+# ── Heatmap Overlay ──────────────────────────────────────────────────────
+
+@app.get("/api/slides/{slide_id}/overlay/heatmap/dzi")
+def get_heatmap_dzi(slide_id: str):
+    entry = _get_slide(slide_id)
+    w, h = entry.slide.dimensions
+    xml = _dzi_xml(w, h, TILE_SIZE, OVERLAP, "png")
+    return Response(xml, media_type="application/xml")
+
+
+@app.get("/api/slides/{slide_id}/overlay/heatmap/tile/{level}/{col}_{row}.png")
+def get_heatmap_tile(
+    slide_id: str, level: int, col: int, row: int,
+    model: str = "mock-default", cell: str = "metastasis", vector: str = "false",
+):
+    entry = _get_slide(slide_id)
+    dz = entry.dz
+    if level < 0 or level >= dz.level_count:
+        raise HTTPException(status_code=404, detail="Invalid level")
+    cols_count, rows_count = dz.level_tiles[level]
+    if col < 0 or row < 0 or col >= cols_count or row >= rows_count:
+        raise HTTPException(status_code=404, detail="Invalid tile address")
+    _, z_size = dz._get_tile_info(level, (col, row))
+    tile = Image.new("RGBA", z_size, (0, 0, 0, 0))
+    bbox = _polys_bbox(entry.polygons)
     seed = _model_seed(model)
-    # Slightly vary offset per model to reduce overlap if multiple are toggled in future
     model_offset = (HEATMAP_OFFSET[0] + (seed % 1024), HEATMAP_OFFSET[1])
+    draw_vector = vector.lower() == "true"
+
     _draw_heatmap_tile(
-        tile,
-        level,
-        col,
-        row,
-        TILE_SIZE,
-        _l0_downsamples,
-        _dz._l0_offset,
-        HEATMAP_CELL_SIZE,
-        seed,
-        palette=cell,
-        bbox=bbox,
-        field_offset=model_offset,
+        tile, level, col, row, TILE_SIZE, entry.l0_downsamples, dz._l0_offset,
+        HEATMAP_CELL_SIZE, seed, palette=cell, bbox=bbox,
+        field_offset=model_offset, draw_vector=draw_vector,
     )
     buf = io.BytesIO()
     tile.save(buf, format="PNG")
     return Response(buf.getvalue(), media_type="image/png")
 
 
-# Convenience root
+# ── Legacy Compatibility (redirect old endpoints) ────────────────────────
+
 @app.get("/api/info")
-def info():
-    return {
-        "slide": str(SLIDE_PATH),
-        "dimensions": _slide.dimensions,
-        "levels": _dz.level_count,
-        "tile_size": TILE_SIZE,
-        "overlap": OVERLAP,
-        "limit_bounds": LIMIT_BOUNDS,
-        "annotations": len(_polygons()),
-        "models": [
-            {"id": "mock-default", "label": "Mock Default"},
-            {"id": "mock-hi-sens", "label": "High Sensitivity"},
-            {"id": "mock-hi-spec", "label": "High Specificity"},
-        ],
-        "cell_classes": [
-            {"id": "metastasis", "label": "Metastasis (tumor)"},
-            {"id": "epithelial", "label": "Epithelial"},
-            {"id": "normal", "label": "Normal"},
-        ],
-    }
+def legacy_info():
+    """Backward-compatible info endpoint — returns data for first available slide."""
+    if not _slide_registry:
+        raise HTTPException(status_code=404, detail="No slides available")
+    first = next(iter(_slide_registry.values()))
+    props = first.get_properties()
+    props["slide"] = str(first.path)
+    props["levels"] = first.dz.level_count
+    props["overlap"] = OVERLAP
+    props["limit_bounds"] = LIMIT_BOUNDS
+    props["annotations"] = len(first.polygons)
+    props["models"] = MODELS
+    props["cell_classes"] = [
+        {"id": k, "label": k.replace("_", " ").title()}
+        for k in HEATMAP_PALETTES.keys()
+    ]
+    return props
+
+
+@app.get("/api/dzi")
+def legacy_dzi():
+    if not _slide_registry:
+        raise HTTPException(status_code=404, detail="No slides available")
+    first = next(iter(_slide_registry.values()))
+    xml = first.dz.get_dzi("jpeg")
+    return Response(xml, media_type="application/xml")
+
+
+@app.get("/api/tile/{level}/{col}_{row}.jpeg")
+def legacy_tile(level: int, col: int, row: int):
+    if not _slide_registry:
+        raise HTTPException(status_code=404, detail="No slides available")
+    first_id = next(iter(_slide_registry.keys()))
+    return get_slide_tile(first_id, level, col, row)
