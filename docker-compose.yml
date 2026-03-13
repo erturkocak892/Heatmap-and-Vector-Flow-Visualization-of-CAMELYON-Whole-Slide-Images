@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mm804-app
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./public:/app/public
+      # Maps local hover_net to docker, optional if you copy it but useful if you download models locally
+      - ./hover_net:/app/hover_net
+      # If you want to develop without rebuilding, you can amount source code
+      # - ./server:/app/server
+      # - ./web:/app/web
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload

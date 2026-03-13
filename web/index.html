@@ -136,29 +136,41 @@
         <div class="section">
           <h3>Visualization Layers</h3>
           <div class="control-group">
-            <div class="row">
-              <span class="label-text">Cell Heatmap</span>
-              <label class="toggle"><input type="checkbox" id="toggle-heat" checked><span class="slider"></span></label>
+            <div id="heatmap-controls">
+              <div class="row">
+                <span class="label-text">Density Heatmap</span>
+                <label class="toggle"><input type="checkbox" id="toggle-heat" disabled><span
+                    class="slider"></span></label>
+              </div>
+              <div class="helper-text" id="heatmap-hint">Select a cell type after inference to enable.</div>
+              <div class="row">
+                <span class="label-text sub">Opacity</span>
+                <input type="range" id="heat-opacity" min="0" max="1" step="0.05" value="0.6">
+              </div>
+              <hr>
+              <div class="row">
+                <span class="label-text accent">Vector Flow Target</span>
+                <label class="toggle"><input type="checkbox" id="toggle-vector"><span class="slider"></span></label>
+              </div>
+              <div class="helper-text">Gradient arrows showing density direction.</div>
             </div>
-            <div class="row">
-              <span class="label-text sub">Opacity</span>
-              <input type="range" id="heat-opacity" min="0" max="1" step="0.05" value="0.5">
-            </div>
-            <hr>
-            <div class="row">
-              <span class="label-text accent">Vector Flow Target</span>
-              <label class="toggle"><input type="checkbox" id="toggle-vector" checked><span
-                  class="slider"></span></label>
-            </div>
-            <div class="helper-text">Steepest-ascent gradient arrows over probabilities.</div>
             <hr>
             <div class="row">
               <span class="label-text">Cell Annotations</span>
-              <label class="toggle"><input type="checkbox" id="toggle-ann" checked><span class="slider"></span></label>
+              <label class="toggle"><input type="checkbox" id="toggle-ann"><span class="slider"></span></label>
             </div>
             <div class="row">
               <span class="label-text sub">Opacity</span>
               <input type="range" id="ann-opacity" min="0" max="1" step="0.05" value="0.7">
+            </div>
+            <hr>
+            <div class="row">
+              <span class="label-text">Inference Overlay</span>
+              <label class="toggle"><input type="checkbox" id="toggle-inference"><span class="slider"></span></label>
+            </div>
+            <div class="row">
+              <span class="label-text sub">Opacity</span>
+              <input type="range" id="inference-opacity" min="0" max="1" step="0.05" value="0.8">
             </div>
           </div>
         </div>
@@ -166,7 +178,64 @@
           <h3>Model Selection</h3>
           <div class="model-cards" id="model-cards"></div>
         </div>
-        <div class="section">
+        <div class="section" id="inference-section" style="display:none">
+          <h3>🧠 Real Inference</h3>
+          <div class="control-group">
+            <div class="helper-text" style="margin-bottom:10px">
+              Draw a region on the slide or use the current viewport. Results will appear as an overlay.
+            </div>
+            <!-- ROI Drawing Controls -->
+            <div class="roi-controls">
+              <button class="action-btn roi-btn" id="draw-roi-btn">✏️ Draw ROI</button>
+              <button class="action-btn roi-btn finish" id="finish-roi-btn" style="display:none">✅ Finish</button>
+              <button class="action-btn roi-btn clear" id="clear-roi-btn" style="display:none">🗑️ Clear</button>
+            </div>
+            <div id="roi-status" class="helper-text" style="margin:6px 0;display:none"></div>
+            <hr style="margin:8px 0">
+            <div class="row">
+              <span class="label-text">Device</span>
+              <select id="inference-device" style="flex:1;margin-left:8px">
+                <option value="auto">Auto (MPS if available)</option>
+                <option value="mps">MPS (Apple Silicon)</option>
+                <option value="cpu">CPU</option>
+              </select>
+            </div>
+            <button class="action-btn inference-btn" id="run-inference-btn">
+              ⚡ Run Inference
+            </button>
+            <!-- Progress Panel -->
+            <div id="inference-progress" class="inference-progress" style="display:none">
+              <div class="inference-progress-header">
+                <div class="inference-spinner"></div>
+                <span id="inference-status-text">Preparing...</span>
+              </div>
+              <div class="progress-bar" style="margin:8px 0">
+                <div class="progress-fill" id="inference-progress-fill" style="width:0%"></div>
+              </div>
+              <div class="inference-progress-footer">
+                <span id="inference-elapsed">0s</span>
+                <button class="cancel-btn" id="cancel-inference-btn">Cancel</button>
+              </div>
+            </div>
+            <!-- Results Panel -->
+            <div id="inference-results" class="inference-results" style="display:none">
+              <div class="inference-results-header">✅ Inference Complete</div>
+              <div id="inference-results-summary"></div>
+            </div>
+          </div>
+        </div>
+        <div class="section" id="inference-filter-section" style="display:none">
+          <h3>Filter Nucleus Type</h3>
+          <div class="control-group">
+            <select id="inference-type-filter">
+              <option value="">All Types</option>
+            </select>
+            <button class="action-btn heatmap-show-btn" id="show-heatmap-btn" style="display:none">
+              🔥 Show Density Heatmap
+            </button>
+          </div>
+        </div>
+        <div class="section" id="cell-type-section">
           <h3>Cell Type</h3>
           <div class="control-group">
             <select id="cell-select"></select>
@@ -182,7 +251,10 @@
           <button class="action-btn" id="analyze-reset" style="margin-top:10px">Recenter Focus</button>
         </div>
       </div>
-      <div id="analyze-osd" class="osd-container"></div>
+      <div id="analyze-osd" class="osd-container">
+        <!-- SVG overlay for polygon drawing -->
+        <svg id="polygon-svg" class="polygon-svg-overlay"></svg>
+      </div>
     </div>
   </div>
 

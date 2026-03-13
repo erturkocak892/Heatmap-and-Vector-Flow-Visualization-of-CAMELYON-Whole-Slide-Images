@@ -21,3 +21,14 @@ plots/
 # Generated tiles/overlays
 public/tiles/
 public/overlays/
+
+# Models and external tools
+hover_net/
+*.pth
+*.pt
+*.tar
+*.h5
+*.pb
+
+# Logs
+*.log

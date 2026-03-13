@@ -44,7 +44,10 @@ from fastapi.staticfiles import StaticFiles
 from openslide import OpenSlide
 from openslide.deepzoom import DeepZoomGenerator
 from PIL import Image, ImageDraw, ImageFilter
+from pydantic import BaseModel
 from skimage.color import rgb2hed, hed2rgb
+
+from server.inference_service import InferenceJobManager, JobStatus
 
 # ── Configuration ────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent
@@ -92,36 +95,46 @@ HEATMAP_PALETTES = {
 }
 
 # Model definitions
+# PanNuke type mapping from type_info.json:
+# 0=nolabel, 1=neoplastic, 2=inflammatory, 3=connective, 4=necrosis, 5=non-neoplastic
+HOVERNET_CELL_TYPES = ["neoplastic", "inflammatory", "connective", "necrosis", "non-neoplastic"]
+HOVERNET_TYPE_COLORS = {
+    "nolabe": (128, 128, 128),
+    "neopla": (255, 0, 0),
+    "inflam": (0, 255, 0),
+    "connec": (0, 0, 255),
+    "necros": (255, 255, 0),
+    "no-neo": (255, 165, 0),
+}
+
 MODELS = [
     {
         "id": "hovernet",
-        "label": "HoVerNet",
-        "description": "Simultaneous segmentation and classification of nuclei in multi-tissue histology images.",
-        "cell_types": ["metastasis", "epithelial", "inflammatory", "normal", "necrosis"],
-    },
-    {
-        "id": "sam",
-        "label": "Segment Anything (SAM)",
-        "description": "Foundation model for promptable segmentation across diverse image domains.",
-        "cell_types": ["metastasis", "epithelial", "normal"],
+        "label": "HoVerNet (PanNuke)",
+        "description": "Real nuclear segmentation & classification. Runs inference on your machine using MPS/CPU.",
+        "cell_types": HOVERNET_CELL_TYPES,
+        "real": True,
     },
     {
         "id": "mock-default",
         "label": "Mock Default",
-        "description": "Default mock model for demonstration purposes.",
+        "description": "Default mock model for demonstration (random heatmap).",
         "cell_types": ["metastasis", "epithelial", "normal"],
+        "real": False,
     },
     {
         "id": "mock-hi-sens",
-        "label": "High Sensitivity",
-        "description": "Mock model calibrated for high sensitivity detection.",
+        "label": "Mock High Sensitivity",
+        "description": "Mock model calibrated for high sensitivity (random heatmap).",
         "cell_types": ["metastasis", "epithelial", "normal"],
+        "real": False,
     },
     {
         "id": "mock-hi-spec",
-        "label": "High Specificity",
-        "description": "Mock model calibrated for high specificity detection.",
+        "label": "Mock High Specificity",
+        "description": "Mock model calibrated for high specificity (random heatmap).",
         "cell_types": ["metastasis", "epithelial", "normal"],
+        "real": False,
     },
 ]
 
@@ -144,6 +157,8 @@ class SlideEntry:
             for dz_level in range(self.dz.level_count)
         )
         self._polygons_cache = None
+        self._tissue_mask = None
+        self._tissue_mask_size = None
 
     @property
     def slide_id(self) -> str:
@@ -157,6 +172,34 @@ class SlideEntry:
             else:
                 self._polygons_cache = []
         return self._polygons_cache
+
+    @property
+    def tissue_mask(self):
+        """Low-res boolean mask: True where tissue exists (not white/black background)."""
+        if self._tissue_mask is None:
+            thumb_size = (512, 512)
+            thumb = self.slide.get_thumbnail(thumb_size)
+            arr = np.array(thumb.convert("RGB"))
+            self._tissue_mask_size = (arr.shape[1], arr.shape[0])  # (w, h)
+            gray = np.mean(arr, axis=2)
+            saturation = np.max(arr, axis=2).astype(float) - np.min(arr, axis=2).astype(float)
+            # Tissue: NOT white AND NOT black, and has some color saturation
+            is_not_white = gray < 220
+            is_not_black = gray > 25
+            has_color = saturation > 15
+            self._tissue_mask = is_not_white & is_not_black & has_color
+        return self._tissue_mask
+
+    def is_tissue(self, l0_x: float, l0_y: float) -> bool:
+        """Check if level-0 coordinate falls on tissue."""
+        mask = self.tissue_mask
+        w, h = self.slide.dimensions
+        mw, mh = self._tissue_mask_size
+        mx = int(l0_x / w * mw)
+        my = int(l0_y / h * mh)
+        if 0 <= mx < mw and 0 <= my < mh:
+            return bool(mask[my, mx])
+        return False
 
     def get_properties(self) -> dict:
         props = dict(self.slide.properties)
@@ -343,7 +386,8 @@ def _draw_tissue_tile(tile, lvl, col, row, tile_size, l0_downsamples, offset, bb
 
 
 def _draw_heatmap_tile(tile, lvl, col, row, tile_size, l0_downsamples, offset, spacing,
-                       model_seed, palette, bbox=None, field_offset=(0, 0), draw_vector=False):
+                       model_seed, palette, bbox=None, field_offset=(0, 0), draw_vector=False,
+                       tissue_check=None):
     down = l0_downsamples[lvl]
     origin_x = col * tile_size
     origin_y = row * tile_size
@@ -366,6 +410,9 @@ def _draw_heatmap_tile(tile, lvl, col, row, tile_size, l0_downsamples, offset, s
             l0_x = (origin_x + x) * down + offset[0]
             if bbox and (l0_x < bx0 or l0_x > bx1):
                 continue
+            # Skip background pixels (only render on tissue)
+            if tissue_check and not tissue_check(l0_x, l0_y):
+                continue
             score = _smooth_noise_score(
                 l0_x + field_offset[0], l0_y + field_offset[1], spacing, model_seed
             )
@@ -386,6 +433,8 @@ def _draw_heatmap_tile(tile, lvl, col, row, tile_size, l0_downsamples, offset, s
             for x in range(step // 2, tile.width, step):
                 l0_x = (origin_x + x) * down + offset[0]
                 if bbox and (l0_x < bx0 or l0_x > bx1):
+                    continue
+                if tissue_check and not tissue_check(l0_x, l0_y):
                     continue
 
                 lx = l0_x + field_offset[0]
@@ -476,10 +525,23 @@ if web_root.exists():
 def root():
     if not web_root.exists():
         return {"message": "web UI not found", "visit": "/api/docs"}
+    landing_path = web_root / "landing.html"
+    if landing_path.exists():
+        return FileResponse(landing_path, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
     index_path = web_root / "index.html"
     if not index_path.exists():
         return {"message": "index.html not found in web/", "visit": "/api/docs"}
-    return FileResponse(index_path)
+    return FileResponse(index_path, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+
+@app.get("/app")
+def app_page():
+    if not web_root.exists():
+        return {"message": "web UI not found", "visit": "/api/docs"}
+    index_path = web_root / "index.html"
+    if not index_path.exists():
+        return {"message": "index.html not found in web/", "visit": "/api/docs"}
+    return FileResponse(index_path, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
 # ── Register demo slide at startup ───────────────────────────────────────
@@ -497,6 +559,15 @@ def _init_demo():
 
 
 _init_demo()
+
+# ── Inference Job Manager ────────────────────────────────────────────────
+inference_manager = InferenceJobManager(ROOT)
+
+
+class InferenceStartRequest(BaseModel):
+    model_id: str = "hovernet"
+    roi: Optional[dict] = None  # {x, y, width, height} in level-0 coords
+    device: str = "auto"
 
 
 # ── Slide Management ────────────────────────────────────────────────────
@@ -705,7 +776,423 @@ def get_heatmap_tile(
         tile, level, col, row, TILE_SIZE, entry.l0_downsamples, dz._l0_offset,
         HEATMAP_CELL_SIZE, seed, palette=cell, bbox=bbox,
         field_offset=model_offset, draw_vector=draw_vector,
+        tissue_check=entry.is_tissue,
     )
+    buf = io.BytesIO()
+    tile.save(buf, format="PNG")
+    return Response(buf.getvalue(), media_type="image/png")
+
+
+# ── Inference Endpoints ──────────────────────────────────────────────────
+
+@app.post("/api/slides/{slide_id}/inference/start")
+def start_inference(slide_id: str, req: InferenceStartRequest):
+    entry = _get_slide(slide_id)
+    job = inference_manager.start_inference(
+        slide_entry=entry,
+        model_id=req.model_id,
+        roi=req.roi,
+        device=req.device,
+    )
+    return job.to_dict()
+
+
+@app.get("/api/slides/{slide_id}/inference/status/{job_id}")
+def get_inference_status(slide_id: str, job_id: str):
+    job = inference_manager.get_job(job_id)
+    if not job or job.slide_id != slide_id:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job.to_dict()
+
+
+@app.post("/api/slides/{slide_id}/inference/cancel/{job_id}")
+def cancel_inference(slide_id: str, job_id: str):
+    success = inference_manager.cancel_job(job_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="Cannot cancel job")
+    return {"status": "cancelled", "job_id": job_id}
+
+
+@app.get("/api/slides/{slide_id}/inference/results/{job_id}")
+def get_inference_results(slide_id: str, job_id: str):
+    job = inference_manager.get_job(job_id)
+    if not job or job.slide_id != slide_id:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != JobStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail=f"Job not completed (status: {job.status.value})")
+    results = job.get_results()
+    if not results:
+        raise HTTPException(status_code=404, detail="Results not found")
+    return results
+
+
+@app.get("/api/slides/{slide_id}/inference/jobs")
+def list_inference_jobs(slide_id: str):
+    _get_slide(slide_id)  # validate slide exists
+    jobs = inference_manager.get_jobs_for_slide(slide_id)
+    return [j.to_dict() for j in jobs]
+
+
+# ── Inference Overlay Tiles ──────────────────────────────────────────────
+
+def _draw_inference_overlay_tile(
+    tile, lvl, col, row, tile_size, l0_downsamples, offset,
+    nuclei_data, filter_type=None, roi_offset=(0, 0),
+):
+    """Render nuclei from inference results onto a transparent tile.
+
+    Args:
+        tile: RGBA PIL Image to draw on
+        lvl, col, row: tile position
+        tile_size: tile size in pixels
+        l0_downsamples: tuple of downsample factors per DZ level
+        offset: DZ level-0 offset (l0_offset)
+        nuclei_data: dict of nuclei from inference JSON
+        filter_type: if set, only render nuclei of this type name
+        roi_offset: (x, y) offset of the ROI in level-0 coordinates
+    """
+    draw = ImageDraw.Draw(tile, "RGBA")
+    down = l0_downsamples[lvl]
+    origin_x = col * tile_size
+    origin_y = row * tile_size
+
+    tile_l0_x0 = origin_x * down + offset[0]
+    tile_l0_y0 = origin_y * down + offset[1]
+    tile_l0_x1 = tile_l0_x0 + tile.width * down
+    tile_l0_y1 = tile_l0_y0 + tile.height * down
+
+    roi_x, roi_y = roi_offset
+
+    # Adaptive sizing based on zoom level
+    # At high zoom (low down), draw detailed dots
+    # At low zoom (high down), smaller dots to prevent overlapping blob
+    dot_radius = max(1, min(4, int(4 / max(1, down ** 0.2))))
+    contour_width = max(1, int(2 / max(1, down ** 0.3)))
+
+    count_drawn = 0
+
+    for nuc_id, nuc in nuclei_data.items():
+        # Filter by type name if specified
+        if filter_type and nuc.get("type_name", "") != filter_type:
+            continue
+
+        # Get centroid in level-0 coordinates
+        centroid = nuc.get("centroid")
+        if not centroid:
+            continue
+        cx_l0 = centroid[0] + roi_x
+        cy_l0 = centroid[1] + roi_y
+
+        # Quick bounding check — skip if nucleus centroid is far from this tile
+        # Use a generous margin to catch nuclei whose dots extend into the tile
+        margin = dot_radius * down * 2
+        if cx_l0 < tile_l0_x0 - margin or cy_l0 < tile_l0_y0 - margin:
+            continue
+        if cx_l0 > tile_l0_x1 + margin or cy_l0 > tile_l0_y1 + margin:
+            continue
+
+        # Get color by type
+        type_name = nuc.get("type_name", "nolabe")
+        base_color = HOVERNET_TYPE_COLORS.get(type_name, (255, 255, 255))
+
+        # Convert centroid to tile-local pixel coordinates
+        dot_x = (cx_l0 - offset[0]) / down - origin_x
+        dot_y = (cy_l0 - offset[1]) / down - origin_y
+
+        # Draw contour if available AND we're zoomed in enough (down <= 64)
+        contour = nuc.get("contour")
+        if contour and len(contour) >= 3 and down <= 64:
+            coords = [
+                (
+                    (pt[0] + roi_x - offset[0]) / down - origin_x,
+                    (pt[1] + roi_y - offset[1]) / down - origin_y,
+                )
+                for pt in contour
+            ]
+            fill_color = base_color + (50,)
+            outline_color = base_color + (180,)
+            try:
+                draw.polygon(coords, fill=fill_color, outline=outline_color)
+            except Exception:
+                pass
+
+        # Draw centroid dot (always visible)
+        r = dot_radius
+        dot_color = base_color + (200,)
+        draw.ellipse([dot_x - r, dot_y - r, dot_x + r, dot_y + r], fill=dot_color)
+        count_drawn += 1
+
+
+@app.get("/api/slides/{slide_id}/overlay/inference/dzi")
+def get_inference_overlay_dzi(slide_id: str):
+    entry = _get_slide(slide_id)
+    w, h = entry.slide.dimensions
+    xml = _dzi_xml(w, h, TILE_SIZE, OVERLAP, "png")
+    return Response(xml, media_type="application/xml")
+
+
+@app.get("/api/slides/{slide_id}/overlay/inference/tile/{level}/{col}_{row}.png")
+def get_inference_overlay_tile(
+    slide_id: str, level: int, col: int, row: int,
+    job_id: str = "", filter_type: str = "",
+):
+    entry = _get_slide(slide_id)
+    dz = entry.dz
+    if level < 0 or level >= dz.level_count:
+        raise HTTPException(status_code=404, detail="Invalid level")
+    cols_count, rows_count = dz.level_tiles[level]
+    if col < 0 or row < 0 or col >= cols_count or row >= rows_count:
+        raise HTTPException(status_code=404, detail="Invalid tile address")
+
+    _, z_size = dz._get_tile_info(level, (col, row))
+    tile = Image.new("RGBA", z_size, (0, 0, 0, 0))
+
+    # Find the latest completed job for this slide, or use specified job_id
+    job = None
+    if job_id:
+        job = inference_manager.get_job(job_id)
+    else:
+        job = inference_manager.get_latest_completed_job(slide_id)
+
+    if job and job.status == JobStatus.COMPLETED:
+        results = job.get_results()
+        if results and "nuclei" in results:
+            # Determine ROI offset
+            roi_offset = (0, 0)
+            if job.roi:
+                roi_offset = (int(job.roi.get("x", 0)), int(job.roi.get("y", 0)))
+
+            ft = filter_type if filter_type else None
+            _draw_inference_overlay_tile(
+                tile, level, col, row, TILE_SIZE, entry.l0_downsamples,
+                dz._l0_offset, results["nuclei"],
+                filter_type=ft, roi_offset=roi_offset,
+            )
+
+    buf = io.BytesIO()
+    tile.save(buf, format="PNG")
+    return Response(buf.getvalue(), media_type="image/png")
+
+
+# ── Density Heatmap Overlay ──────────────────────────────────────────────
+
+# Cold-to-hot color ramp for density heatmap
+DENSITY_COLORMAP = [
+    (0.0, (30, 30, 120)),     # dark blue
+    (0.2, (50, 100, 200)),    # blue
+    (0.4, (30, 180, 180)),    # cyan
+    (0.6, (100, 220, 100)),   # green
+    (0.8, (255, 220, 50)),    # yellow
+    (1.0, (255, 60, 30)),     # red
+]
+
+
+def _density_color(t):
+    """Map t in [0,1] to an RGBA color using the density colormap."""
+    t = max(0.0, min(1.0, t))
+    for i in range(1, len(DENSITY_COLORMAP)):
+        t0, c0 = DENSITY_COLORMAP[i - 1]
+        t1, c1 = DENSITY_COLORMAP[i]
+        if t <= t1:
+            f = (t - t0) / max(0.001, t1 - t0)
+            r = int(c0[0] + f * (c1[0] - c0[0]))
+            g = int(c0[1] + f * (c1[1] - c0[1]))
+            b = int(c0[2] + f * (c1[2] - c0[2]))
+            alpha = int(40 + 140 * t)  # more opaque where denser
+            return (r, g, b, alpha)
+    c = DENSITY_COLORMAP[-1][1]
+    return (c[0], c[1], c[2], 180)
+
+
+def _build_density_grid(nuclei_data, cell_type, roi, grid_spacing=64):
+    """Build a density grid counting nuclei per grid cell.
+
+    Returns: (grid dict, max_count, grid_spacing)
+    Grid keys are (gx, gy) in level-0 coordinates divided by spacing.
+    """
+    rx, ry = roi.get("x", 0), roi.get("y", 0)
+    grid = {}
+    for nuc_id, nuc in nuclei_data.items():
+        if cell_type and nuc.get("type_name", "") != cell_type:
+            continue
+        centroid = nuc.get("centroid")
+        if not centroid:
+            continue
+        cx = centroid[0] + rx
+        cy = centroid[1] + ry
+        gx = int(cx // grid_spacing)
+        gy = int(cy // grid_spacing)
+        grid[(gx, gy)] = grid.get((gx, gy), 0) + 1
+
+    max_count = max(grid.values()) if grid else 0
+    return grid, max_count, grid_spacing
+
+
+def _draw_density_tile(tile, lvl, col, row, tile_size, l0_downsamples, offset,
+                       density_grid, max_count, grid_spacing, roi, draw_vector=False):
+    """Render density heatmap onto a tile using pre-computed density grid."""
+    if max_count == 0:
+        return
+
+    draw = ImageDraw.Draw(tile, "RGBA")
+    down = l0_downsamples[lvl]
+    origin_x = col * tile_size
+    origin_y = row * tile_size
+
+    rx = roi.get("x", 0)
+    ry = roi.get("y", 0)
+    rw = roi.get("width", 0)
+    rh = roi.get("height", 0)
+
+    # For each pixel in the tile, determine density and color it
+    # We sample at a coarser resolution for performance
+    sample_step = max(1, int(down ** 0.3))  # coarser stepping when zoomed out
+
+    for py in range(0, tile.height, sample_step):
+        l0_y = (origin_y + py) * down + offset[1]
+        if l0_y < ry or l0_y > ry + rh:
+            continue
+        for px in range(0, tile.width, sample_step):
+            l0_x = (origin_x + px) * down + offset[0]
+            if l0_x < rx or l0_x > rx + rw:
+                continue
+
+            # Get density from grid (with simple smoothing from neighbors)
+            gx = int(l0_x // grid_spacing)
+            gy = int(l0_y // grid_spacing)
+            count = density_grid.get((gx, gy), 0)
+            # Add neighbors for smoothing
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    if dx == 0 and dy == 0:
+                        continue
+                    count += density_grid.get((gx + dx, gy + dy), 0) * 0.25
+
+            t = min(1.0, count / max(1, max_count))
+            if t < 0.01:
+                continue
+
+            color = _density_color(t)
+            # Fill the sample block
+            for fy in range(sample_step):
+                for fx in range(sample_step):
+                    if py + fy < tile.height and px + fx < tile.width:
+                        try:
+                            tile.putpixel((px + fx, py + fy), color)
+                        except Exception:
+                            pass
+
+    # Draw vector flow arrows showing density gradient direction
+    if draw_vector and tile_size >= 128:
+        step = 32
+        max_arrow_len = 14
+        min_arrow_len = 4
+
+        for y in range(step // 2, tile.height, step):
+            l0_y = (origin_y + y) * down + offset[1]
+            if l0_y < ry or l0_y > ry + rh:
+                continue
+            for x in range(step // 2, tile.width, step):
+                l0_x = (origin_x + x) * down + offset[0]
+                if l0_x < rx or l0_x > rx + rw:
+                    continue
+
+                gx = int(l0_x // grid_spacing)
+                gy = int(l0_y // grid_spacing)
+
+                # Compute gradient via neighbor differences
+                c_right = density_grid.get((gx + 1, gy), 0)
+                c_left = density_grid.get((gx - 1, gy), 0)
+                c_down = density_grid.get((gx, gy + 1), 0)
+                c_up = density_grid.get((gx, gy - 1), 0)
+
+                ddx = (c_right - c_left) / max(1, max_count)
+                ddy = (c_down - c_up) / max(1, max_count)
+                mag = math.hypot(ddx, ddy)
+                if mag < 0.05:
+                    continue
+
+                norm_mag = min(1.0, mag / 0.3)
+                ddx /= mag
+                ddy /= mag
+                arrow_len = min_arrow_len + (max_arrow_len - min_arrow_len) * norm_mag
+                alpha = int(100 + 155 * norm_mag)
+
+                end_x = x + ddx * arrow_len
+                end_y = y + ddy * arrow_len
+
+                shadow = (0, 0, 0, int(alpha * 0.6))
+                color = (255, 255, 255, alpha)
+                draw.line([(x + 1, y + 1), (end_x + 1, end_y + 1)], fill=shadow, width=1)
+                draw.line([(x, y), (end_x, end_y)], fill=color, width=1)
+
+                angle = math.atan2(ddy, ddx)
+                head_len = 4 + 2 * norm_mag
+                a1 = angle + math.pi * 0.90
+                a2 = angle - math.pi * 0.90
+                hx1 = end_x + math.cos(a1) * head_len
+                hy1 = end_y + math.sin(a1) * head_len
+                hx2 = end_x + math.cos(a2) * head_len
+                hy2 = end_y + math.sin(a2) * head_len
+                draw.polygon([(end_x + 1, end_y + 1), (hx1 + 1, hy1 + 1), (hx2 + 1, hy2 + 1)], fill=shadow)
+                draw.polygon([(end_x, end_y), (hx1, hy1), (hx2, hy2)], fill=color)
+
+
+# Density grid cache: keyed by (job_id, cell_type)
+_density_cache = {}
+
+
+@app.get("/api/slides/{slide_id}/overlay/density/dzi")
+def get_density_dzi(slide_id: str):
+    entry = _get_slide(slide_id)
+    w, h = entry.slide.dimensions
+    xml = _dzi_xml(w, h, TILE_SIZE, OVERLAP, "png")
+    return Response(xml, media_type="application/xml")
+
+
+@app.get("/api/slides/{slide_id}/overlay/density/tile/{level}/{col}_{row}.png")
+def get_density_tile(
+    slide_id: str, level: int, col: int, row: int,
+    job_id: str = "", cell_type: str = "", vector: str = "false",
+):
+    entry = _get_slide(slide_id)
+    dz = entry.dz
+    if level < 0 or level >= dz.level_count:
+        raise HTTPException(status_code=404, detail="Invalid level")
+    cols_count, rows_count = dz.level_tiles[level]
+    if col < 0 or row < 0 or col >= cols_count or row >= rows_count:
+        raise HTTPException(status_code=404, detail="Invalid tile address")
+
+    _, z_size = dz._get_tile_info(level, (col, row))
+    tile = Image.new("RGBA", z_size, (0, 0, 0, 0))
+
+    # Find the job
+    job = None
+    if job_id:
+        job = inference_manager.get_job(job_id)
+    else:
+        job = inference_manager.get_latest_completed_job(slide_id)
+
+    if job and job.status == JobStatus.COMPLETED:
+        results = job.get_results()
+        if results and "nuclei" in results:
+            roi = job.roi or {"x": 0, "y": 0, "width": 0, "height": 0}
+            cache_key = (job.job_id, cell_type)
+
+            if cache_key not in _density_cache:
+                grid, max_count, spacing = _build_density_grid(
+                    results["nuclei"], cell_type if cell_type else None, roi
+                )
+                _density_cache[cache_key] = (grid, max_count, spacing)
+            else:
+                grid, max_count, spacing = _density_cache[cache_key]
+
+            _draw_density_tile(
+                tile, level, col, row, TILE_SIZE, entry.l0_downsamples,
+                dz._l0_offset, grid, max_count, spacing, roi,
+                draw_vector=(vector.lower() == "true"),
+            )
+
     buf = io.BytesIO()
     tile.save(buf, format="PNG")
     return Response(buf.getvalue(), media_type="image/png")
