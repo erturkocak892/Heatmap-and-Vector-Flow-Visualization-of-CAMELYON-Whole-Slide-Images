@@ -9,7 +9,7 @@ Follow these instructions carefully to get the project up and running. The codeb
 ### Step 1: Clone this Repository
 Clone this main project directory to your local machine:
 ```bash
-git clone <YOUR_GITHUB_REPO_LINK>
+git clone https://github.com/erturkocak892/Heatmap-Visualization-of-CAMELYON-Dataset.git
 cd "MM804 Project"
 ```
 
@@ -43,7 +43,7 @@ To keep this repository lightweight, the HoVer-Net source code and its multi-gig
 
 ### Step 3: Add Sample WSI Data (622949.svs)
 You will need our core test slide **`622949.svs`**.
-1. **Download the Slide:** Download `622949.svs` from our shared Google Drive folder *(Author: Please insert the Google Drive link here)*.
+1. **Download the Slide:** Download `622949.svs` from our shared Google Drive folder *https://drive.google.com/file/d/11uMmQcCq2Nak3SO2Uu2mfeNJqxwEjWXx/view?usp=share_link*.
 2. **Place the Slide:** Move the downloaded `.svs` file into the `data/` directory.
 
 ```bash
