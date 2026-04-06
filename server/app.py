@@ -1005,13 +1005,13 @@ def _density_color(t):
 
 
 def _build_density_grid(nuclei_data, cell_type, roi, grid_spacing=64):
-    """Build a density grid counting nuclei per grid cell.
+    """Build a smoothed density grid counting nuclei per grid cell.
 
     Returns: (grid dict, max_count, grid_spacing)
     Grid keys are (gx, gy) in level-0 coordinates divided by spacing.
     """
     rx, ry = roi.get("x", 0), roi.get("y", 0)
-    grid = {}
+    raw_grid = {}
     for nuc_id, nuc in nuclei_data.items():
         if cell_type and nuc.get("type_name", "") != cell_type:
             continue
@@ -1022,10 +1022,25 @@ def _build_density_grid(nuclei_data, cell_type, roi, grid_spacing=64):
         cy = centroid[1] + ry
         gx = int(cx // grid_spacing)
         gy = int(cy // grid_spacing)
-        grid[(gx, gy)] = grid.get((gx, gy), 0) + 1
+        raw_grid[(gx, gy)] = raw_grid.get((gx, gy), 0) + 1
 
-    max_count = max(grid.values()) if grid else 0
-    return grid, max_count, grid_spacing
+    if not raw_grid:
+        return {}, 0, grid_spacing
+
+    kernel = {
+        (0, 0): 1.00,
+        (-1, 0): 0.60, (1, 0): 0.60, (0, -1): 0.60, (0, 1): 0.60,
+        (-1, -1): 0.25, (-1, 1): 0.25, (1, -1): 0.25, (1, 1): 0.25,
+        (-2, 0): 0.10, (2, 0): 0.10, (0, -2): 0.10, (0, 2): 0.10,
+    }
+    smooth_grid = {}
+    for (gx, gy), count in raw_grid.items():
+        for (dx, dy), weight in kernel.items():
+            key = (gx + dx, gy + dy)
+            smooth_grid[key] = smooth_grid.get(key, 0.0) + count * weight
+
+    max_count = max(smooth_grid.values()) if smooth_grid else 0
+    return smooth_grid, max_count, grid_spacing
 
 
 def _draw_density_tile(tile, lvl, col, row, tile_size, l0_downsamples, offset,
@@ -1057,16 +1072,9 @@ def _draw_density_tile(tile, lvl, col, row, tile_size, l0_downsamples, offset,
             if l0_x < rx or l0_x > rx + rw:
                 continue
 
-            # Get density from grid (with simple smoothing from neighbors)
             gx = int(l0_x // grid_spacing)
             gy = int(l0_y // grid_spacing)
             count = density_grid.get((gx, gy), 0)
-            # Add neighbors for smoothing
-            for dx in [-1, 0, 1]:
-                for dy in [-1, 0, 1]:
-                    if dx == 0 and dy == 0:
-                        continue
-                    count += density_grid.get((gx + dx, gy + dy), 0) * 0.25
 
             t = min(1.0, count / max(1, max_count))
             if t < 0.01:
@@ -1084,9 +1092,9 @@ def _draw_density_tile(tile, lvl, col, row, tile_size, l0_downsamples, offset,
 
     # Draw vector flow arrows showing density gradient direction
     if draw_vector and tile_size >= 128:
-        step = 32
-        max_arrow_len = 14
-        min_arrow_len = 4
+        step = 44
+        max_arrow_len = 24
+        min_arrow_len = 10
 
         for y in range(step // 2, tile.height, step):
             l0_y = (origin_y + y) * down + offset[1]
@@ -1100,41 +1108,43 @@ def _draw_density_tile(tile, lvl, col, row, tile_size, l0_downsamples, offset,
                 gx = int(l0_x // grid_spacing)
                 gy = int(l0_y // grid_spacing)
 
-                # Compute gradient via neighbor differences
-                c_right = density_grid.get((gx + 1, gy), 0)
-                c_left = density_grid.get((gx - 1, gy), 0)
-                c_down = density_grid.get((gx, gy + 1), 0)
-                c_up = density_grid.get((gx, gy - 1), 0)
+                # Move uphill on the smoothed density field toward denser regions.
+                c_right = density_grid.get((gx + 1, gy), 0.0)
+                c_left = density_grid.get((gx - 1, gy), 0.0)
+                c_down = density_grid.get((gx, gy + 1), 0.0)
+                c_up = density_grid.get((gx, gy - 1), 0.0)
+                c_here = density_grid.get((gx, gy), 0.0)
 
                 ddx = (c_right - c_left) / max(1, max_count)
                 ddy = (c_down - c_up) / max(1, max_count)
                 mag = math.hypot(ddx, ddy)
-                if mag < 0.05:
+                if c_here <= 0 or mag < 0.015:
                     continue
 
-                norm_mag = min(1.0, mag / 0.3)
+                norm_mag = min(1.0, mag / 0.14)
                 ddx /= mag
                 ddy /= mag
                 arrow_len = min_arrow_len + (max_arrow_len - min_arrow_len) * norm_mag
-                alpha = int(100 + 155 * norm_mag)
+                alpha = int(170 + 85 * norm_mag)
 
                 end_x = x + ddx * arrow_len
                 end_y = y + ddy * arrow_len
 
-                shadow = (0, 0, 0, int(alpha * 0.6))
+                shadow = (0, 0, 0, int(alpha * 0.90))
                 color = (255, 255, 255, alpha)
-                draw.line([(x + 1, y + 1), (end_x + 1, end_y + 1)], fill=shadow, width=1)
-                draw.line([(x, y), (end_x, end_y)], fill=color, width=1)
+
+                draw.line([(x + 2, y + 2), (end_x + 2, end_y + 2)], fill=shadow, width=7)
+                draw.line([(x, y), (end_x, end_y)], fill=color, width=4)
 
                 angle = math.atan2(ddy, ddx)
-                head_len = 4 + 2 * norm_mag
-                a1 = angle + math.pi * 0.90
-                a2 = angle - math.pi * 0.90
+                head_len = 8 + 4 * norm_mag
+                a1 = angle + math.pi * 0.84
+                a2 = angle - math.pi * 0.84
                 hx1 = end_x + math.cos(a1) * head_len
                 hy1 = end_y + math.sin(a1) * head_len
                 hx2 = end_x + math.cos(a2) * head_len
                 hy2 = end_y + math.sin(a2) * head_len
-                draw.polygon([(end_x + 1, end_y + 1), (hx1 + 1, hy1 + 1), (hx2 + 1, hy2 + 1)], fill=shadow)
+                draw.polygon([(end_x + 2, end_y + 2), (hx1 + 2, hy1 + 2), (hx2 + 2, hy2 + 2)], fill=shadow)
                 draw.polygon([(end_x, end_y), (hx1, hy1), (hx2, hy2)], fill=color)
 
 

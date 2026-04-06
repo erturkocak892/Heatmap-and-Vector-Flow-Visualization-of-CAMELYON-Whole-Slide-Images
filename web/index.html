@@ -148,11 +148,11 @@
                 <input type="range" id="heat-opacity" min="0" max="1" step="0.05" value="0.6">
               </div>
               <hr>
-              <div class="row">
-                <span class="label-text accent">Vector Flow Target</span>
-                <label class="toggle"><input type="checkbox" id="toggle-vector"><span class="slider"></span></label>
-              </div>
-              <div class="helper-text">Gradient arrows showing density direction.</div>
+              <input type="checkbox" id="toggle-vector" hidden>
+              <button class="action-btn flow-show-btn" id="show-flow-btn" style="display:none">
+                ↗ Show Flow Vectors
+              </button>
+              <div class="helper-text" id="flow-hint">Show directional arrows flowing toward the densest heatmap regions.</div>
             </div>
             <hr>
             <div class="row">
@@ -182,13 +182,13 @@
           <h3>🧠 Real Inference</h3>
           <div class="control-group">
             <div class="helper-text" style="margin-bottom:10px">
-              Draw a region on the slide or use the current viewport. Results will appear as an overlay.
+              Drag a rectangular region on the slide or use the current viewport. Results will appear as an overlay.
             </div>
             <!-- ROI Drawing Controls -->
             <div class="roi-controls">
               <button class="action-btn roi-btn" id="draw-roi-btn">✏️ Draw ROI</button>
-              <button class="action-btn roi-btn finish" id="finish-roi-btn" style="display:none">✅ Finish</button>
-              <button class="action-btn roi-btn clear" id="clear-roi-btn" style="display:none">🗑️ Clear</button>
+              <button class="action-btn roi-btn finish" id="finish-roi-btn" style="display:none">✖ Cancel</button>
+              <button class="action-btn roi-btn clear" id="clear-roi-btn" style="display:none">🗑️ Clear ROI</button>
             </div>
             <div id="roi-status" class="helper-text" style="margin:6px 0;display:none"></div>
             <hr style="margin:8px 0">
@@ -233,6 +233,9 @@
             <button class="action-btn heatmap-show-btn" id="show-heatmap-btn" style="display:none">
               🔥 Show Density Heatmap
             </button>
+            <button class="action-btn flow-show-btn" id="show-flow-inline-btn" style="display:none">
+              ↗ Show Flow Vectors
+            </button>
           </div>
         </div>
         <div class="section" id="cell-type-section">
@@ -252,7 +255,7 @@
         </div>
       </div>
       <div id="analyze-osd" class="osd-container">
-        <!-- SVG overlay for polygon drawing -->
+        <div id="roi-hit-area" class="roi-hit-area"></div>
         <svg id="polygon-svg" class="polygon-svg-overlay"></svg>
       </div>
     </div>
@@ -285,7 +288,7 @@
     </div>
   </div>
 
-  <script src="/web/app.js"></script>
+  <script src="/web/app.js?v=roi-rect-2"></script>
 </body>
 
 </html>

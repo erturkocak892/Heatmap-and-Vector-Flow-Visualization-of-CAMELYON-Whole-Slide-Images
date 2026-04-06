@@ -12,10 +12,11 @@ let annLayer = null, heatLayer = null, inferLayer = null;
 let currentJobId = null;
 let inferencePollingInterval = null;
 
-// Polygon drawing state
+// ROI drawing state
 let drawingMode = false;
-let polygonPoints = [];   // [{x, y}] in image coordinates
-let roiPolygon = null;    // finalized polygon [{x, y}]
+let dragStartPoint = null;
+let draftROI = null;      // {x, y, width, height} while dragging
+let roiRect = null;       // finalized ROI in image coordinates
 
 // ── OSD Custom Controls ──────────────────────────────────────
 function injectOSDControls(containerId, osdViewer) {
@@ -356,11 +357,15 @@ async function initAnalyze(slideId) {
     document.getElementById('inference-results').style.display = 'none';
     document.getElementById('inference-filter-section').style.display = 'none';
     document.getElementById('toggle-inference').checked = false;
+    document.getElementById('show-heatmap-btn').style.display = 'none';
+    document.getElementById('show-flow-btn').style.display = 'none';
+    document.getElementById('show-flow-inline-btn').style.display = 'none';
 
     // Set smart defaults based on selected model type
     const isRealModel = firstModel && firstModel.real;
     document.getElementById('toggle-heat').checked = false;
     document.getElementById('toggle-heat').disabled = true; // disabled until cell type selected
+    document.getElementById('toggle-vector').checked = false;
     document.getElementById('toggle-ann').checked = false;
 
     const baseSrc = {
@@ -476,140 +481,187 @@ async function initAnalyze(slideId) {
         }
     }
 
-    // ── Polygon Drawing Logic ────────────────────────────────
+    // ── ROI Drawing Logic ────────────────────────────────────
     const svgOverlay = document.getElementById('polygon-svg');
+    const roiHitArea = document.getElementById('roi-hit-area');
 
-    function startDrawing() {
-        drawingMode = true;
-        polygonPoints = [];
-        roiPolygon = null;
-        document.getElementById('draw-roi-btn').style.display = 'none';
-        document.getElementById('finish-roi-btn').style.display = '';
-        document.getElementById('clear-roi-btn').style.display = '';
-        document.getElementById('roi-status').style.display = '';
-        document.getElementById('roi-status').textContent = 'Click on the slide to add vertices. Double-click or press Finish to close.';
-        document.getElementById('analyze-osd').classList.add('drawing-mode');
-        // Disable OSD panning while drawing
-        analyzeOSD.setMouseNavEnabled(false);
-        updatePolygonSVG();
+    function clampImagePoint(pt) {
+        return {
+            x: Math.max(0, Math.min(info.dimensions[0], Math.round(pt.x))),
+            y: Math.max(0, Math.min(info.dimensions[1], Math.round(pt.y))),
+        };
     }
 
-    function addPolygonVertex(viewportPoint) {
-        if (!drawingMode) return;
-        const imgPt = analyzeOSD.viewport.viewportToImageCoordinates(viewportPoint.x, viewportPoint.y);
-        polygonPoints.push({ x: Math.round(imgPt.x), y: Math.round(imgPt.y) });
-        document.getElementById('roi-status').textContent = `${polygonPoints.length} vertices placed. Click more or Finish.`;
-        updatePolygonSVG();
+    function getImagePointFromClientPosition(clientX, clientY) {
+        const rect = roiHitArea.getBoundingClientRect();
+        const pixel = new OpenSeadragon.Point(clientX - rect.left, clientY - rect.top);
+        const viewportPoint = analyzeOSD.viewport.pointFromPixel(pixel);
+        const imagePoint = analyzeOSD.viewport.viewportToImageCoordinates(viewportPoint);
+        return clampImagePoint(imagePoint);
     }
 
-    function finishDrawing() {
-        if (polygonPoints.length < 3) {
-            document.getElementById('roi-status').textContent = 'Need at least 3 vertices!';
-            return;
-        }
-        drawingMode = false;
-        roiPolygon = [...polygonPoints];
-        document.getElementById('draw-roi-btn').style.display = 'none';
-        document.getElementById('finish-roi-btn').style.display = 'none';
-        document.getElementById('clear-roi-btn').style.display = '';
-        document.getElementById('analyze-osd').classList.remove('drawing-mode');
-        analyzeOSD.setMouseNavEnabled(true);
-        // Show bounding box info
-        const bb = getPolygonBBox(roiPolygon);
-        document.getElementById('roi-status').textContent = `ROI set: ${bb.width}×${bb.height}px region`;
-        updatePolygonSVG();
+    function normalizeROI(a, b) {
+        const x1 = Math.min(a.x, b.x);
+        const y1 = Math.min(a.y, b.y);
+        const x2 = Math.max(a.x, b.x);
+        const y2 = Math.max(a.y, b.y);
+        return { x: x1, y: y1, width: x2 - x1, height: y2 - y1 };
     }
 
-    function clearPolygon() {
-        drawingMode = false;
-        polygonPoints = [];
-        roiPolygon = null;
+    function updateROIButtons() {
+        const hasROI = !!roiRect;
         document.getElementById('draw-roi-btn').style.display = '';
-        document.getElementById('finish-roi-btn').style.display = 'none';
-        document.getElementById('clear-roi-btn').style.display = 'none';
-        document.getElementById('roi-status').style.display = 'none';
-        document.getElementById('analyze-osd').classList.remove('drawing-mode');
-        analyzeOSD.setMouseNavEnabled(true);
-        updatePolygonSVG();
+        document.getElementById('draw-roi-btn').textContent = hasROI ? '✏️ Redraw ROI' : '✏️ Draw ROI';
+        document.getElementById('finish-roi-btn').style.display = drawingMode ? '' : 'none';
+        document.getElementById('clear-roi-btn').style.display = (drawingMode || hasROI) ? '' : 'none';
     }
 
-    function getPolygonBBox(pts) {
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        for (const p of pts) {
-            if (p.x < minX) minX = p.x;
-            if (p.y < minY) minY = p.y;
-            if (p.x > maxX) maxX = p.x;
-            if (p.y > maxY) maxY = p.y;
-        }
-        return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
-    }
+    function updateROIOverlay() {
+        const rect = drawingMode && draftROI ? draftROI : roiRect;
 
-    function updatePolygonSVG() {
-        const pts = drawingMode ? polygonPoints : (roiPolygon || []);
-        if (pts.length === 0) {
+        if (!rect || rect.width <= 0 || rect.height <= 0) {
             svgOverlay.innerHTML = '';
             return;
         }
 
-        // Convert image coords to OSD-container-relative pixel coords
-        const screenPts = pts.map(p => {
-            const vp = analyzeOSD.viewport.imageToViewportCoordinates(
-                new OpenSeadragon.Point(p.x, p.y)
-            );
-            const px = analyzeOSD.viewport.viewportToViewerElementCoordinates(vp);
-            return { x: px.x, y: px.y };
-        });
+        const topLeftVp = analyzeOSD.viewport.imageToViewportCoordinates(
+            new OpenSeadragon.Point(rect.x, rect.y)
+        );
+        const bottomRightVp = analyzeOSD.viewport.imageToViewportCoordinates(
+            new OpenSeadragon.Point(rect.x + rect.width, rect.y + rect.height)
+        );
+        const topLeftPx = analyzeOSD.viewport.viewportToViewerElementCoordinates(topLeftVp);
+        const bottomRightPx = analyzeOSD.viewport.viewportToViewerElementCoordinates(bottomRightVp);
 
-        let html = '';
-        // Draw polygon fill + outline
-        const pointStr = screenPts.map(p => `${p.x},${p.y}`).join(' ');
-        const isClosed = !drawingMode && roiPolygon;
-        html += `<polygon points="${pointStr}" fill="${isClosed ? 'rgba(0,200,255,0.12)' : 'none'}" stroke="#00c8ff" stroke-width="2" stroke-dasharray="${isClosed ? 'none' : '6,4'}" ${isClosed ? '' : 'fill="none"'}/>`;
+        const x = Math.min(topLeftPx.x, bottomRightPx.x);
+        const y = Math.min(topLeftPx.y, bottomRightPx.y);
+        const width = Math.abs(bottomRightPx.x - topLeftPx.x);
+        const height = Math.abs(bottomRightPx.y - topLeftPx.y);
 
-        // Draw vertices
-        for (const p of screenPts) {
-            html += `<circle cx="${p.x}" cy="${p.y}" r="5" fill="#00c8ff" stroke="#fff" stroke-width="1.5"/>`;
-        }
-
-        // Draw lines while drawing
-        if (drawingMode && screenPts.length >= 2) {
-            for (let i = 0; i < screenPts.length - 1; i++) {
-                html += `<line x1="${screenPts[i].x}" y1="${screenPts[i].y}" x2="${screenPts[i + 1].x}" y2="${screenPts[i + 1].y}" stroke="#00c8ff" stroke-width="2"/>`;
-            }
-        }
-
-        svgOverlay.innerHTML = html;
+        svgOverlay.innerHTML = `
+            <rect
+                x="${x}"
+                y="${y}"
+                width="${width}"
+                height="${height}"
+                rx="6"
+                ry="6"
+                fill="rgba(0,200,255,0.14)"
+                stroke="#00c8ff"
+                stroke-width="2"
+            />
+        `;
     }
 
-    // Update polygon overlay on ANY viewport change
-    analyzeOSD.addHandler('animation', updatePolygonSVG);
-    analyzeOSD.addHandler('animation-finish', updatePolygonSVG);
-    analyzeOSD.addHandler('zoom', updatePolygonSVG);
-    analyzeOSD.addHandler('pan', updatePolygonSVG);
-    analyzeOSD.addHandler('open', updatePolygonSVG);
+    function stopDrawingMode() {
+        drawingMode = false;
+        dragStartPoint = null;
+        draftROI = null;
+        document.getElementById('analyze-osd').classList.remove('drawing-mode');
+        roiHitArea.classList.remove('active');
+        analyzeOSD.setMouseNavEnabled(true);
+        updateROIButtons();
+        updateROIOverlay();
+    }
 
-    // Handle clicks for polygon drawing
-    analyzeOSD.addHandler('canvas-click', function (event) {
-        if (drawingMode) {
-            event.preventDefaultAction = true;
-            const vp = analyzeOSD.viewport.pointFromPixel(event.position);
-            addPolygonVertex(vp);
+    function startDrawing() {
+        drawingMode = true;
+        dragStartPoint = null;
+        draftROI = null;
+        roiRect = null;
+        document.getElementById('roi-status').style.display = '';
+        document.getElementById('roi-status').textContent = 'Drag on the slide to draw a rectangular ROI.';
+        document.getElementById('analyze-osd').classList.add('drawing-mode');
+        roiHitArea.classList.add('active');
+        analyzeOSD.setMouseNavEnabled(false);
+        updateROIButtons();
+        updateROIOverlay();
+    }
+
+    function cancelDrawing() {
+        stopDrawingMode();
+        if (roiRect) {
+            document.getElementById('roi-status').style.display = '';
+            document.getElementById('roi-status').textContent = `ROI set: ${roiRect.width}×${roiRect.height}px region`;
+        } else {
+            document.getElementById('roi-status').style.display = 'none';
         }
+    }
+
+    function clearROI() {
+        roiRect = null;
+        draftROI = null;
+        dragStartPoint = null;
+        stopDrawingMode();
+        document.getElementById('roi-status').style.display = 'none';
+    }
+
+    function finalizeROI(endPoint) {
+        const nextROI = normalizeROI(dragStartPoint, endPoint);
+        dragStartPoint = null;
+        draftROI = null;
+
+        if (nextROI.width < 8 || nextROI.height < 8) {
+            document.getElementById('roi-status').style.display = '';
+            document.getElementById('roi-status').textContent = 'ROI too small. Drag a larger region.';
+            updateROIOverlay();
+            return;
+        }
+
+        roiRect = nextROI;
+        stopDrawingMode();
+        document.getElementById('roi-status').style.display = '';
+        document.getElementById('roi-status').textContent = `ROI set: ${roiRect.width}×${roiRect.height}px region`;
+    }
+
+    updateROIButtons();
+    updateROIOverlay();
+
+    analyzeOSD.addHandler('animation', updateROIOverlay);
+    analyzeOSD.addHandler('animation-finish', updateROIOverlay);
+    analyzeOSD.addHandler('zoom', updateROIOverlay);
+    analyzeOSD.addHandler('pan', updateROIOverlay);
+    analyzeOSD.addHandler('open', updateROIOverlay);
+
+    roiHitArea.addEventListener('pointerdown', function (event) {
+        if (!drawingMode) return;
+        event.preventDefault();
+        roiHitArea.setPointerCapture(event.pointerId);
+        dragStartPoint = getImagePointFromClientPosition(event.clientX, event.clientY);
+        draftROI = { x: dragStartPoint.x, y: dragStartPoint.y, width: 0, height: 0 };
+        document.getElementById('roi-status').style.display = '';
+        document.getElementById('roi-status').textContent = 'Drawing ROI: 0×0px';
+        updateROIOverlay();
     });
-    analyzeOSD.addHandler('canvas-double-click', function (event) {
-        if (drawingMode) {
-            event.preventDefaultAction = true;
-            finishDrawing();
-        }
+
+    roiHitArea.addEventListener('pointermove', function (event) {
+        if (!drawingMode || !dragStartPoint) return;
+        event.preventDefault();
+        const currentPoint = getImagePointFromClientPosition(event.clientX, event.clientY);
+        draftROI = normalizeROI(dragStartPoint, currentPoint);
+        document.getElementById('roi-status').style.display = '';
+        document.getElementById('roi-status').textContent = `Drawing ROI: ${draftROI.width}×${draftROI.height}px`;
+        updateROIOverlay();
+    });
+
+    roiHitArea.addEventListener('pointerup', function (event) {
+        if (!drawingMode || !dragStartPoint) return;
+        event.preventDefault();
+        finalizeROI(getImagePointFromClientPosition(event.clientX, event.clientY));
+    });
+
+    roiHitArea.addEventListener('pointercancel', function () {
+        if (!drawingMode) return;
+        dragStartPoint = null;
+        draftROI = null;
+        updateROIOverlay();
     });
 
     // ── Inference Logic ──────────────────────────────────────
     function getROI() {
-        // Use drawn polygon bounding box if available, otherwise viewport
-        if (roiPolygon && roiPolygon.length >= 3) {
-            return getPolygonBBox(roiPolygon);
+        if (roiRect && roiRect.width > 0 && roiRect.height > 0) {
+            return roiRect;
         }
-        // Fallback: viewport ROI
         const bounds = analyzeOSD.viewport.getBounds(true);
         const topLeft = analyzeOSD.viewport.viewportToImageCoordinates(bounds.x, bounds.y);
         const bottomRight = analyzeOSD.viewport.viewportToImageCoordinates(
@@ -769,10 +821,15 @@ async function initAnalyze(slideId) {
             // Enable density heatmap toggle now that results are available
             document.getElementById('toggle-heat').disabled = false;
             document.getElementById('heatmap-hint').textContent = 'Select a cell type filter, then click Show Heatmap.';
+            document.getElementById('flow-hint').textContent = 'Show arrows that flow toward the densest regions in the selected heatmap.';
 
             // Show the heatmap action button in the filter section
             const heatmapActionBtn = document.getElementById('show-heatmap-btn');
             if (heatmapActionBtn) heatmapActionBtn.style.display = '';
+            const flowActionBtn = document.getElementById('show-flow-btn');
+            const flowInlineBtn = document.getElementById('show-flow-inline-btn');
+            if (flowActionBtn) flowActionBtn.style.display = '';
+            if (flowInlineBtn) flowInlineBtn.style.display = '';
 
         } catch (e) {
             console.error('Failed to show results:', e);
@@ -804,8 +861,8 @@ async function initAnalyze(slideId) {
     document.getElementById('run-inference-btn').onclick = () => startInference();
     document.getElementById('cancel-inference-btn').onclick = () => cancelInference();
     document.getElementById('draw-roi-btn').onclick = () => startDrawing();
-    document.getElementById('finish-roi-btn').onclick = () => finishDrawing();
-    document.getElementById('clear-roi-btn').onclick = () => clearPolygon();
+    document.getElementById('finish-roi-btn').onclick = () => cancelDrawing();
+    document.getElementById('clear-roi-btn').onclick = () => clearROI();
     document.getElementById('inference-type-filter').onchange = () => {
         reloadInferenceOverlay();
         // Also reload density heatmap if it's already on
@@ -822,6 +879,17 @@ async function initAnalyze(slideId) {
         heatToggle.checked = true;
         reloadHeat();
     };
+    function showFlowVectors() {
+        analyzeOSD.setMouseNavEnabled(true);
+        const heatToggle = document.getElementById('toggle-heat');
+        const vectorToggle = document.getElementById('toggle-vector');
+        heatToggle.disabled = false;
+        heatToggle.checked = true;
+        vectorToggle.checked = true;
+        reloadHeat();
+    }
+    document.getElementById('show-flow-btn').onclick = () => showFlowVectors();
+    document.getElementById('show-flow-inline-btn').onclick = () => showFlowVectors();
 
     // Initial layers — only load what's checked (respects smart defaults above)
     if (document.getElementById('toggle-ann').checked) toggleLayer('ann', true);

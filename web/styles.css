@@ -1009,7 +1009,19 @@ input[type="range"]::-webkit-slider-thumb:hover {
   padding: 8px;
 }
 
-/* ── Polygon Drawing ─────────────────────────────────────── */
+/* ── ROI Drawing ─────────────────────────────────────────── */
+.roi-hit-area {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9;
+}
+
+.roi-hit-area.active {
+  pointer-events: auto;
+  cursor: crosshair;
+}
+
 .polygon-svg-overlay {
   position: absolute;
   top: 0;
@@ -1085,6 +1097,23 @@ input[type="range"]::-webkit-slider-thumb:hover {
   background: linear-gradient(135deg, rgba(255, 100, 30, 0.30), rgba(255, 200, 50, 0.20)) !important;
   box-shadow: 0 4px 16px rgba(255, 140, 60, 0.35) !important;
   border-color: #ffb347 !important;
+}
+
+.flow-show-btn {
+  background: linear-gradient(135deg, rgba(56, 189, 248, 0.18), rgba(34, 211, 238, 0.10)) !important;
+  border-color: rgba(56, 189, 248, 0.45) !important;
+  color: #74d8ff !important;
+  font-size: 13px !important;
+  padding: 12px !important;
+  font-weight: 700 !important;
+  margin-top: 6px;
+  letter-spacing: 0.3px;
+}
+
+.flow-show-btn:hover {
+  background: linear-gradient(135deg, rgba(56, 189, 248, 0.28), rgba(34, 211, 238, 0.18)) !important;
+  box-shadow: 0 4px 16px rgba(56, 189, 248, 0.28) !important;
+  border-color: #74d8ff !important;
 }
 
 /* ── OpenSeadragon Custom Controls ───────────────────────── */

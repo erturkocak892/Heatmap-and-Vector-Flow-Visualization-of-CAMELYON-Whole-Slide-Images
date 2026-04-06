@@ -66,8 +66,8 @@ To verify everything is working:
 1. Open your browser and go to [http://localhost:8000/](http://localhost:8000/).
 2. You will see the application interface.
 3. Select an existing slide or upload a new one via the "Upload Slide" button.
-4. **(Note: The Draw ROI polygon tool is currently under maintenance.** Instead of drawing a polygon, simply zoom in/pan on the viewport to your desired tissue area).
-5. Open the **Analyze** tab and click **"Run Inference"**. This will automatically process the region currently visible on your screen.
+4. Open the **Analyze** tab and use **"Draw ROI"** to drag a rectangular inference region, or simply leave it unset to use the current viewport.
+5. Click **"Run Inference"**. This will automatically process the selected region or the region currently visible on your screen.
 6. You will see a progress bar. The server is extracting the patch and running `hover_net` in the background.
 7. Once completed, toggle the **"Inference Results"** or **"Cell Density Heatmap"** overlays. You should clearly see the cellular segmentation contours and hot/cold density mapping.
 
