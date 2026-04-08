@@ -23,6 +23,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY hover_net/environment.yml ./hover_net/
 COPY hover_net/requirements.txt ./hover_net/
 RUN conda env create -f hover_net/environment.yml
+RUN conda run -n hovernet pip install --no-cache-dir torch==1.6.0 torchvision==0.7.0
 
 # Copy the rest of the application
 COPY server/ ./server/

@@ -673,6 +673,16 @@ input[type="range"]::-webkit-slider-thumb:hover {
   background: rgba(139, 92, 246, 0.06);
 }
 
+.model-card.unavailable {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.model-card.unavailable:hover {
+  background: transparent;
+  border-color: rgba(255, 255, 255, 0.06);
+}
+
 .model-card-name {
   font-size: 14px;
   font-weight: 600;
@@ -850,6 +860,12 @@ input[type="range"]::-webkit-slider-thumb:hover {
   background: rgba(139, 155, 180, 0.1);
   color: var(--muted);
   border: 1px solid rgba(139, 155, 180, 0.2);
+}
+
+.model-badge.setup {
+  background: rgba(251, 191, 36, 0.12);
+  color: #fcd34d;
+  border: 1px solid rgba(251, 191, 36, 0.25);
 }
 
 /* ── Inference Button ────────────────────────────────────── */

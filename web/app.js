@@ -18,6 +18,10 @@ let dragStartPoint = null;
 let draftROI = null;      // {x, y, width, height} while dragging
 let roiRect = null;       // finalized ROI in image coordinates
 
+function isModelAvailable(model) {
+    return model && model.available !== false;
+}
+
 // ── OSD Custom Controls ──────────────────────────────────────
 function injectOSDControls(containerId, osdViewer) {
     // Remove any existing custom controls
@@ -273,16 +277,18 @@ async function initAnalyze(slideId) {
     // Model cards
     const mc = document.getElementById('model-cards');
     const models = info.models || [];
+    const availableModels = models.filter(isModelAvailable);
 
     if (models.length === 0) {
         mc.innerHTML = '<div class="meta-empty">No models available.</div>';
     } else {
-        currentModel = models[0].id;
-        mc.innerHTML = models.map((m, i) => `
-      <div class="model-card ${i === 0 ? 'active' : ''}" data-model="${m.id}" id="model-${m.id}">
+        currentModel = (availableModels[0] || models[0]).id;
+        mc.innerHTML = models.map((m) => `
+      <div class="model-card ${m.id === currentModel ? 'active' : ''} ${isModelAvailable(m) ? '' : 'unavailable'}" data-model="${m.id}" id="model-${m.id}">
         <div class="model-card-name">
           ${m.label}
           ${m.real ? '<span class="model-badge real">REAL</span>' : '<span class="model-badge mock">MOCK</span>'}
+          ${isModelAvailable(m) ? '' : '<span class="model-badge setup">SETUP</span>'}
         </div>
         <div class="model-card-desc">${m.description}</div>
       </div>
@@ -293,6 +299,7 @@ async function initAnalyze(slideId) {
             const card = document.getElementById('model-' + m.id);
             if (card) {
                 card.addEventListener('click', () => {
+                    if (!isModelAvailable(m)) return;
                     currentModel = m.id;
                     document.querySelectorAll('.model-card').forEach(c => c.classList.toggle('active', c.dataset.model === m.id));
                     // Update cell types for this model
@@ -328,22 +335,25 @@ async function initAnalyze(slideId) {
         });
 
         // Show inference section if first model is real
-        const firstModel = models[0];
+        const firstModel = availableModels[0] || models[0];
         const inferSection = document.getElementById('inference-section');
-        inferSection.style.display = firstModel.real ? '' : 'none';
+        inferSection.style.display = (firstModel.real && isModelAvailable(firstModel)) ? '' : 'none';
 
         // Hide/show heatmap controls based on model type
         const heatControls = document.getElementById('heatmap-controls');
         const cellTypeSection = document.getElementById('cell-type-section');
-        if (firstModel.real) {
+        if (firstModel.real && isModelAvailable(firstModel)) {
             if (heatControls) heatControls.style.display = 'none';
             if (cellTypeSection) cellTypeSection.style.display = 'none';
+        } else {
+            if (heatControls) heatControls.style.display = '';
+            if (cellTypeSection) cellTypeSection.style.display = '';
         }
     }
 
     // Cell type selector
     const cs = document.getElementById('cell-select');
-    const firstModel = models.find(m => m.id === currentModel);
+    const firstModel = models.find(m => m.id === currentModel) || availableModels[0] || models[0];
     const cellTypes = firstModel ? firstModel.cell_types : ['metastasis', 'epithelial', 'normal'];
     cs.innerHTML = cellTypes.map(c => `<option value="${c}">${c.charAt(0).toUpperCase() + c.slice(1)}</option>`).join('');
     currentCell = cellTypes[0] || 'metastasis';

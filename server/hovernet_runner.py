@@ -21,8 +21,6 @@ Output: JSON file with structure:
 }
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import math
@@ -58,7 +56,7 @@ def load_model(model_path, nr_types=6, mode="fast", device=None):
     from run_utils.utils import convert_pytorch_checkpoint
 
     net = create_model(nr_types=nr_types, mode=mode)
-    saved_state_dict = torch.load(model_path, map_location="cpu", weights_only=False)["desc"]
+    saved_state_dict = torch.load(model_path, map_location="cpu")["desc"]
     saved_state_dict = convert_pytorch_checkpoint(saved_state_dict)
     net.load_state_dict(saved_state_dict, strict=True)
 
