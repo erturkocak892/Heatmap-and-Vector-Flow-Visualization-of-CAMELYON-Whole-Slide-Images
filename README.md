@@ -1,6 +1,6 @@
-# MM804 Project: Heatmap Visualization of CAMELYON Dataset
+# MM804 Project: Heatmap Visualization of CAMELYON and TCGA-BRCA WSIs
 
-This project provides a full-stack web application for visualizing whole-slide images (WSI), running cell segmentation/classification inferences (via HoVer-Net), and visualizing the results through density heatmaps and vector overlays.
+This project provides a full-stack web application for visualizing whole-slide images (WSI), running cell segmentation/classification inferences (via HoVer-Net), and visualizing the results through density heatmaps and vector overlays. The current setup supports representative dataset slides from both CAMELYON and TCGA-BRCA.
 
 ## Getting Started: Step-by-Step Guide
 
@@ -9,8 +9,8 @@ Follow these instructions carefully to get the project up and running. The codeb
 ### Step 1: Clone this Repository
 Clone this main project directory to your local machine:
 ```bash
-git clone https://github.com/erturkocak892/Heatmap-Visualization-of-CAMELYON-Dataset.git
-cd "MM804 Project"
+git clone https://github.com/sushmitabajgain/Heatmap-and-Vector-Flow-Visualization-of-CAMELYON-Whole-Slide-Images.git
+cd "Heatmap-and-Vector-Flow-Visualization-of-CAMELYON-Whole-Slide-Images"
 ```
 
 ### Step 2: Download HoVer-Net and Required Model
@@ -44,18 +44,19 @@ To keep this repository lightweight, the HoVer-Net source code and its multi-gig
    ```
 
 ### Step 3: Add Sample WSI Data
-You can run the project with the main CAMELYON example slide and, if available, an additional TCGA-BRCA slide.
+You can run the project with two dataset slides: one CAMELYON WSI and one TCGA-BRCA WSI.
 
-1. **Main CAMELYON Slide:** Download `622949.svs` from the shared Google Drive folder:
+1. **CAMELYON WSI:** Download `622949.svs` from the shared Google Drive folder:
    `https://drive.google.com/file/d/11uMmQcCq2Nak3SO2Uu2mfeNJqxwEjWXx/view?usp=share_link`
-2. **Place the Slide:** Move the downloaded `.svs` file into the `data/` directory.
-3. **Optional Additional Slide:** If you have the extra TCGA-BRCA file, place it in the uploads/data area as well:
+2. **Place the CAMELYON Slide:** Move the downloaded `.svs` file into the `data/` directory.
+3. **TCGA-BRCA WSI:** Place the following file in the uploads/data area as well:
    `TCGA-OL-A5RW-01Z-00-DX1.E16DE8EE-31AF-4EAF-A85F-DB3E3E2C3BFF.svs`
 
 ```bash
 mkdir -p data
-# Place the CAMELYON slide here: data/622949.svs
-# Optional additional slide:
+# Place the CAMELYON slide here:
+# data/622949.svs
+# Place the TCGA-BRCA slide here:
 # data/uploads/TCGA-OL-A5RW-01Z-00-DX1.E16DE8EE-31AF-4EAF-A85F-DB3E3E2C3BFF.svs
 ```
 
@@ -74,7 +75,7 @@ Because the codebase requires both a Python 3.10 environment (for FastAPI) and a
 To verify everything is working:
 1. Open your browser and go to [http://localhost:8000/](http://localhost:8000/).
 2. You will see the application interface.
-3. Select an existing slide or upload a new one via the "Upload Slide" button.
+3. Select one of the available dataset slides from the gallery. When both files are present, you should see the CAMELYON WSI and the TCGA-BRCA WSI in the interface.
 4. Open the **Analyze** tab and use **"Draw ROI"** to drag a rectangular inference region, or simply leave it unset to use the current viewport.
 5. Choose **HoVerNet (PanNuke)** and set the device to **CPU** if you are running on a laptop without GPU acceleration.
 6. Click **"Run Inference"**. This will automatically process the selected region or the region currently visible on your screen.
@@ -137,7 +138,8 @@ If `http://localhost:8000/` does not open:
 If inference is taking too long:
 - draw a smaller ROI
 - avoid analyzing the entire viewport at once
-- start with the CAMELYON slide `622949.svs` and zoom into a focused tissue area first
+- start with either dataset slide and zoom into a focused tissue area first
+- the TCGA-BRCA WSI is smaller and can be useful for quicker test runs before using larger CAMELYON regions
 
 ### Slides are not showing in the UI
 If the gallery is empty:
@@ -149,6 +151,6 @@ If the gallery is empty:
 
 ## Additional Notes
 
-- The main demonstration slide is `622949.svs` from the CAMELYON dataset.
-- An additional TCGA-BRCA slide can also be used to test multi-slide loading and compatibility.
+- The project currently uses two dataset slides: `622949.svs` from CAMELYON and `TCGA-OL-A5RW-01Z-00-DX1.E16DE8EE-31AF-4EAF-A85F-DB3E3E2C3BFF.svs` from TCGA-BRCA.
+- Both slides use the same gallery, viewing, ROI selection, HoVer-Net inference, and overlay workflow.
 - This project has been tested in a CPU-based setup, so the documented inference flow is suitable for laptop use with smaller ROIs.
