@@ -98,6 +98,17 @@ class InferenceJobManager:
         self.model_path = project_root / "hover_net" / "hovernet_fast_pannuke_type_tf2pytorch.tar"
         self.type_info_path = project_root / "hover_net" / "type_info.json"
 
+    def hovernet_missing_assets(self) -> list[str]:
+        missing = []
+        hover_net_dir = self.project_root / "hover_net"
+        if not hover_net_dir.exists():
+            missing.append("hover_net/ source directory")
+        if not self.model_path.exists():
+            missing.append("hover_net/hovernet_fast_pannuke_type_tf2pytorch.tar")
+        if not self.type_info_path.exists():
+            missing.append("hover_net/type_info.json")
+        return missing
+
     def start_inference(
         self,
         slide_entry,  # SlideEntry from the main app
@@ -113,6 +124,14 @@ class InferenceJobManager:
             roi: optional region of interest {x, y, width, height} in level-0 coords
             device: 'auto', 'mps', or 'cpu'
         """
+        if model_id == "hovernet":
+            missing_assets = self.hovernet_missing_assets()
+            if missing_assets:
+                missing_str = ", ".join(missing_assets)
+                raise FileNotFoundError(
+                    f"HoVer-Net is not configured yet. Missing: {missing_str}."
+                )
+
         job_id = uuid.uuid4().hex[:12]
         job = InferenceJob(
             job_id=job_id,

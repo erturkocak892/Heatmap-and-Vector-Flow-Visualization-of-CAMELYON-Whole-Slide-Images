@@ -139,6 +139,42 @@ MODELS = [
 ]
 
 
+def _hovernet_assets_status() -> tuple[bool, list[str]]:
+    missing = []
+    hover_net_dir = ROOT / "hover_net"
+    if not hover_net_dir.exists():
+        missing.append("clone the hover_net repository into the project root")
+    model_path = hover_net_dir / "hovernet_fast_pannuke_type_tf2pytorch.tar"
+    if not model_path.exists():
+        missing.append("download hovernet_fast_pannuke_type_tf2pytorch.tar into hover_net/")
+    type_info_path = hover_net_dir / "type_info.json"
+    if not type_info_path.exists():
+        missing.append("restore hover_net/type_info.json")
+    return (len(missing) == 0, missing)
+
+
+def _get_models() -> list[dict]:
+    hovernet_ready, hovernet_missing = _hovernet_assets_status()
+    models = []
+    for model in MODELS:
+        entry = dict(model)
+        if model["id"] == "hovernet":
+            entry["available"] = hovernet_ready
+            if hovernet_ready:
+                entry["description"] = (
+                    f'{model["description"]} Model weights detected in hover_net/.'
+                )
+            else:
+                entry["description"] = (
+                    f'{model["description"]} Setup still needed: {"; ".join(hovernet_missing)}.'
+                )
+        else:
+            entry["available"] = True
+        models.append(entry)
+    models.sort(key=lambda item: (not item["available"], item["real"]))
+    return models
+
+
 # ── Slide Registry (in-memory) ──────────────────────────────────────────
 
 class SlideEntry:
@@ -624,7 +660,7 @@ def delete_slide(slide_id: str):
 def slide_info(slide_id: str):
     entry = _get_slide(slide_id)
     info = entry.get_properties()
-    info["models"] = MODELS
+    info["models"] = _get_models()
     return info
 
 
@@ -1222,7 +1258,7 @@ def legacy_info():
     props["overlap"] = OVERLAP
     props["limit_bounds"] = LIMIT_BOUNDS
     props["annotations"] = len(first.polygons)
-    props["models"] = MODELS
+    props["models"] = _get_models()
     props["cell_classes"] = [
         {"id": k, "label": k.replace("_", " ").title()}
         for k in HEATMAP_PALETTES.keys()
